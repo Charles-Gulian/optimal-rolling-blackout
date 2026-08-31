@@ -1,0 +1,15 @@
+name: weather-env
+channels:
+  - defaults
+dependencies:
+  - jupyter
+  - matplotlib
+  - numpy
+  - pandas
+  - scipy
+  - ipympl
+  - ffmpeg
+  - dask
+  - netcdf4
+  - gurobi
+prefix: /opt/anaconda3/envs/weather-env
