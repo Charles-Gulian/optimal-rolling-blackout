@@ -4,3 +4,6 @@
 /weather-data/accum-data/
 /api-key.txt
 /wind-data/
+/data/
+__pycache__/
+.DS_Store

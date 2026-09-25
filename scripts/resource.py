@@ -1,0 +1,178 @@
+import numpy as np
+import pandas as pd
+import cvxpy as cp
+
+from component import Component, T
+
+
+class Resource(Component):
+
+    def __init__(self, name, data):
+        super().__init__()
+
+        self.name = name
+        self.data = data
+
+        # Unpack basic resource attributes from data
+        self.node_ID = data["Bus ID"]  # Bus ID
+        self.unit_type = data["Unit Type"]  # Unit type
+        self.pmax = data["PMax MW"]  # Nameplate capacity (MW)
+        self.VOM = data["VOM"]  # Variable O&M costs ($/MWh)
+
+        # Initialize node
+        self.node = None
+
+    @classmethod
+    def from_series(cls, df: pd.Series):
+        return cls(df.name, df)
+
+    def link_node(self, nodes: dict):
+        # Link node to resource
+        self.node = nodes[self.node_ID]
+        # Link resource to node
+        nodes[self.node_ID].resources.append(self)
+
+    def create_variables(self):
+        self.p_out = cp.Variable(T, nonneg=True)
+
+    def write_constraints(self):
+        return [self.p_out <= self.pmax]
+
+
+class ThermalResource(Resource):
+
+    def __init__(self, name, data):
+        super().__init__(name, data)
+
+        # Unpack thermal resource attributes from data
+
+        # Cost attributes
+        self.fuel_price = data["Fuel Price $/MMBTU"]
+        self.heat_rate = data["HR_avg_0"] / 1000  # BTU/kWh --> MMBTU/MWh
+        self.variable_costs = self.fuel_price * self.heat_rate + self.VOM
+
+        # Operational attributes
+        self.pmin = data["PMin MW"]  # Minimum output (for unit commitment
+        self.ramp_rate = 60 * data["Ramp Rate MW/Min"]
+        self.FOR = data["FOR"]
+
+
+class VariableResource(Resource):
+
+    def __init__(self, name, data):
+        super().__init__(name, data)
+
+        # Resource type
+        if self.unit_type in ["PV", "RTPV"]:
+            self.resource_type = "solar"
+        elif self.unit_type in ["WIND"]:
+            self.resource_type = "wind"
+        elif self.unit_type in ["HYDRO", "ROR"]:
+            self.resource_type = "hydro"
+        else:
+            print(f"Unknown variable resource type: {self.unit_type}")
+            self.resource_type = None
+
+        # Cost attributes
+        self.variable_costs = self.VOM
+
+        # Operational attributes
+        self.nameplate_capacity = data["PMax MW"]
+
+        # Initialize generation profile
+        self.gen_profile = None
+
+    def get_gen_profile(self, year):
+        # Infer resource type
+        if self.resource_type == "solar":
+            data_source = "NSRDB"
+        elif self.resource_type == "wind":
+            data_source = "WTK-LED"
+        ts_data_dir = self.system.base_dir / f"{self.resource_type}-data" / "profiles"
+        ts_data_path = ts_data_dir / f"bus{self.node_ID}" / f"{data_source}_profile_bus{self.node_ID}_{year}.csv"
+        df_profile = pd.read_csv(ts_data_path, index_col=[0])
+        df_profile.index = pd.to_datetime(df_profile.index)
+        self.gen_profile = df_profile.squeeze()
+
+    def create_parameters(self):
+        self.pmax = cp.Parameter(T)
+
+    def update_timeseries_parameters(self, date: pd.Timestamp):
+        self.pmax.value = self.nameplate_capacity * self.gen_profile.loc[date:date + pd.Timedelta(hours=T - 1)].values
+
+
+class HydroResource(VariableResource):
+    """Hydro and run-of-river.
+
+    Same dispatch behaviour as wind/solar -- zero marginal cost, capped hourly by
+    a profile -- so it inherits the parameter/variable machinery. It differs only
+    in where the profile comes from:
+
+    * There is no multi-year hydro data, so every simulated year re-uses the one
+      RTS-GMLC profile, which is stamped 2020.
+    * That profile lives in the RTS-GMLC repo (MW, one column per unit), not in
+      the NSRDB/WTK-LED profile folders the other resources read from.
+    """
+
+    def get_gen_profile(self, year):
+        ts_data_path = self.system.system_dir / "timeseries_data_files" / "Hydro" / "DAY_AHEAD_hydro.csv"
+        df = pd.read_csv(ts_data_path)
+        stamp = (pd.to_datetime(dict(year=df.Year, month=df.Month, day=df.Day))
+                 + pd.to_timedelta(df.Period - 1, unit="h"))
+
+        # File is in MW; store per-unit so update_timeseries_parameters can scale
+        # by nameplate the same way it does for wind and solar.
+        source = pd.Series(df[self.name].to_numpy(dtype=float) / self.nameplate_capacity,
+                           index=stamp)
+
+        # Re-map the source calendar onto the requested year by (month, day, hour)
+        # rather than by position, so seasonality stays aligned. The source year
+        # (2020) is a leap year, so 29 Feb is available when the target needs it
+        # and simply goes unused when it does not.
+        source.index = pd.MultiIndex.from_arrays(
+            [source.index.month, source.index.day, source.index.hour]
+        )
+        source = source[~source.index.duplicated()]
+
+        target = pd.date_range(f"{year}-01-01 00:00:00", f"{year}-12-31 23:00:00", freq="h")
+        key = pd.MultiIndex.from_arrays([target.month, target.day, target.hour])
+        values = source.reindex(key).to_numpy()
+        if np.isnan(values).any():
+            raise ValueError(f"{self.name}: hydro profile has gaps when re-mapped to {year}")
+
+        self.gen_profile = pd.Series(values, index=target)
+
+
+class StorageResource(Resource):
+
+    def __init__(self, name, data, duration=4.0):
+        super().__init__(name, data)
+
+        # Cost attributes
+        self.variable_costs = self.VOM
+
+        # Operational attributes
+        self.duration = duration
+        self.max_SOC = self.pmax * self.duration
+        self.efficiency = data["Storage Roundtrip Efficiency"] / 100
+
+    def create_variables(self):
+        self.charge = cp.Variable(T, nonneg=True)
+        self.discharge = cp.Variable(T, nonneg=True)
+        self.SOC = cp.Variable(T, nonneg=True)
+
+    def create_expressions(self):
+        self.p_out = self.discharge - self.charge
+
+    def write_constraints(self):
+        constraints = [
+            self.charge <= self.pmax,
+            self.discharge <= self.pmax,
+            self.SOC <= self.max_SOC
+        ]
+        constraints += [
+            self.SOC[t] == self.SOC[np.mod(t - 1, T)] + self.efficiency * self.charge[np.mod(t - 1, T)]
+            - self.discharge[np.mod(t - 1, T)]
+            for t in range(T)
+        ]
+        return constraints
