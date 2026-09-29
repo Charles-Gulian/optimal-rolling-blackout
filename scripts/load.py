@@ -20,7 +20,7 @@ class Load(Component):
     # Profile filename per load type, under load-data/profiles/bus{bus}/.
     PROFILE_PATTERNS = {
         "baseline": "NSRDB_load-profile_bus{bus}_{year}.csv",
-        "hvac": "NSRDB_hvac-load-profile_bus{bus}_{year}.csv",
+        "cooling": "NSRDB_cooling-load-profile_bus{bus}_{year}.csv",
         "other": "NSRDB_other-load-profile_bus{bus}_{year}.csv",
     }
 

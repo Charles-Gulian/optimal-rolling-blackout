@@ -114,6 +114,26 @@ class System:
         # Create list of components
         return list(self.nodes.values()) + list(self.lines.values()) + list(self.loads.values()) + list(self.resources.values())
 
+    @property
+    def load_profile(self):
+        """Hourly system load (MW) for the year read in by read_timeseries.
+
+        Each load's normalized profile scaled by its own peak, summed across
+        every load at every bus. bus.csv's MW Load column plays no part.
+        """
+        if any(load.load_profile is None for load in self.loads.values()):
+            raise RuntimeError("call read_timeseries(year) before reading load_profile")
+        return sum(load.peak_load * load.load_profile for load in self.loads.values())
+
+    @property
+    def peak_load(self):
+        """Coincident system peak (MW).
+
+        The maximum of the summed profiles, not the sum of individual peaks --
+        loads peak at different hours, so the latter would overstate it.
+        """
+        return self.load_profile.max()
+
     def read_timeseries(self, year):
         for load in self.loads.values():
             load.get_load_profile(year)
