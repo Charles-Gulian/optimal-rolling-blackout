@@ -7,6 +7,7 @@ import pathlib
 from component import T
 from node import Node
 from line import Line
+from load import Load
 from resource import ThermalResource, VariableResource, HydroResource, StorageResource
 
 
@@ -25,6 +26,7 @@ class System:
         df_bus = pd.read_csv(system_dir / system_config / "bus.csv", index_col=[0])
         df_line = pd.read_csv(system_dir / system_config / "branch.csv", index_col=[0])
         df_gen = pd.read_csv(system_dir / system_config / "gen.csv", index_col=[0])
+        df_load = pd.read_csv(system_dir / system_config / "load.csv", index_col=[0])
 
         # Select unit types
         unit_types = ["CT", "STEAM", "CC", "NUCLEAR", "PV", "RTPV", "WIND", "HYDRO", "ROR", "STORAGE"]
@@ -38,12 +40,17 @@ class System:
         for node in df_bus.index:
             self.nodes[node] = Node.from_series(df_bus.loc[node])
 
-        # 2. Instantiate lines
+        # 2. Instantiate loads (one row per bus and load type in load.csv)
+        self.loads = {}
+        for load in df_load.index:
+            self.loads[load] = Load.from_series(df_load.loc[load])
+
+        # 3. Instantiate lines
         self.lines = {}
         for line in df_line.index:
             self.lines[line] = Line.from_series(df_line.loc[line])
 
-        # 3. Instantiate resources
+        # 4. Instantiate resources
         thermal_resource_types = ["CT", "STEAM", "CC", "NUCLEAR"]
         variable_resource_types = ["PV", "RTPV", "WIND"]
         hydro_resource_types = ["HYDRO", "ROR"]
@@ -63,13 +70,39 @@ class System:
             elif unit_type in storage_resource_types:
                 self.storage_resources[resource] = StorageResource.from_series(df_gen.loc[resource])
 
-        # 4. Link various components
+        # 5. Link various components
         for obj in self.components:
             obj.link_system(self) # Link component to system
+        for load in self.loads.values():
+            load.link_node(self.nodes)  # Link load to node
         for resource in self.resources.values():
             resource.link_node(self.nodes)  # Link resource to node
         for line in self.lines.values():
             line.link_nodes(self.nodes)  # Link line to nodes
+
+    @property
+    def has_blackouts(self):
+        return any(node.blackout_enabled for node in self.nodes.values())
+
+    def enable_blackouts(self, nodes=None):
+        """Make load shedding an all-or-nothing binary decision per node.
+
+        Defaults to nodes that actually carry load. The other 22 buses would
+        otherwise get binaries that are entirely unconstrained -- unserved
+        energy is zero there regardless -- which only enlarges the search tree.
+
+        Call before write_opf(); the problem is rebuilt from the components, so
+        toggling and rebuilding switches modes without re-reading any data.
+        """
+        if nodes is None:
+            nodes = [name for name, node in self.nodes.items() if node.loads]
+        for name in nodes:
+            self.nodes[name].blackout_enabled = True
+
+    def disable_blackouts(self):
+        for node in self.nodes.values():
+            node.blackout_enabled = False
+            node.blackout = None
 
     @property
     def resources(self):
@@ -79,11 +112,11 @@ class System:
     @property
     def components(self):
         # Create list of components
-        return list(self.nodes.values()) + list(self.lines.values()) + list(self.resources.values())
+        return list(self.nodes.values()) + list(self.lines.values()) + list(self.loads.values()) + list(self.resources.values())
 
     def read_timeseries(self, year):
-        for node in self.nodes.values():
-            node.get_load_profile(year)
+        for load in self.loads.values():
+            load.get_load_profile(year)
         for resource in self.variable_resources.values():
             resource.get_gen_profile(year)
         for resource in self.hydro_resources.values():
@@ -111,7 +144,7 @@ class System:
 
         # Get total system variable costs
         self.total_variable_costs = cp.sum(cp.sum([cp.multiply(r.variable_costs, r.p_out) for r in self.resources.values()]))
-        self.total_unserved_energy_costs = cp.sum(cp.sum([n.VOLL * n.unserved_energy for n in self.nodes.values()]))
+        self.total_unserved_energy_costs = cp.sum(cp.sum([l.VOLL * l.unserved_energy for l in self.loads.values()]))
         self.total_cost = self.total_variable_costs + self.total_unserved_energy_costs # + startup costs + ... etc.
         self.objective = cp.Minimize(self.total_cost)
 
@@ -135,14 +168,14 @@ class System:
     def dispatch_results(self):
         # Collect dispatch results
         df_dispatch = pd.DataFrame()
-        df_dispatch["load"] = sum(node.load.value for node in self.nodes.values())
+        df_dispatch["load"] = sum(load.demand.value for load in self.loads.values())
         df_dispatch["thermal"] = sum(resource.p_out.value for resource in self.thermal_resources.values())
         df_dispatch["solar"] = sum(resource.p_out.value for resource in self.variable_resources.values() if resource.resource_type == "solar")
         df_dispatch["wind"] = sum(resource.p_out.value for resource in self.variable_resources.values() if resource.resource_type == "wind")
         df_dispatch["hydro"] = sum(resource.p_out.value for resource in self.hydro_resources.values())
         df_dispatch["storage charge"] = sum(resource.charge.value for resource in self.storage_resources.values())
         df_dispatch["storage discharge"] = sum(resource.discharge.value for resource in self.storage_resources.values())
-        df_dispatch["unserved energy"] = sum(node.unserved_energy.value for node in self.nodes.values())
+        df_dispatch["unserved energy"] = sum(load.unserved_energy.value for load in self.loads.values())
 
         # Correct index
         df_dispatch.index = pd.date_range(start=self.opf_date, periods=24, freq="h", tz="UTC")
@@ -214,8 +247,11 @@ class System:
             # Save results
             df_results.loc[date, "Cost"] = self.total_variable_costs.value
             df_results.loc[date, "Unserved Energy"] = cp.sum(
-                cp.sum([n.unserved_energy for n in self.nodes.values()])).value
-            for n in self.nodes.keys():
-                df_LMP.loc[date:date + pd.Timedelta(hours=T - 1), n] = -self.nodes[n].power_balance_constraint.dual_value
+                cp.sum([l.unserved_energy for l in self.loads.values()])).value
+            # Gurobi returns no duals for a MIP, so there are no LMPs once
+            # blackout decisions are binary.
+            if not self.has_blackouts:
+                for n in self.nodes.keys():
+                    df_LMP.loc[date:date + pd.Timedelta(hours=T - 1), n] = -self.nodes[n].power_balance_constraint.dual_value
 
         return df_results, df_LMP

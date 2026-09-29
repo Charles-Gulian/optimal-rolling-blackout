@@ -105,30 +105,27 @@ class HydroResource(VariableResource):
     """Hydro and run-of-river.
 
     Same dispatch behaviour as wind/solar -- zero marginal cost, capped hourly by
-    a profile -- so it inherits the parameter/variable machinery. It differs only
-    in where the profile comes from:
+    a per-unit profile -- so it inherits the parameter/variable machinery. It
+    differs only in the calendar: there is no multi-year hydro data, so every
+    simulated year re-uses the single RTS-GMLC profile, which is stamped 2020.
 
-    * There is no multi-year hydro data, so every simulated year re-uses the one
-      RTS-GMLC profile, which is stamped 2020.
-    * That profile lives in the RTS-GMLC repo (MW, one column per unit), not in
-      the NSRDB/WTK-LED profile folders the other resources read from.
+    Profiles are built by data-scripts/hydro_data.py into the same per-bus
+    layout the NSRDB/WTK-LED profiles use.
     """
 
+    SOURCE_YEAR = 2020
+
     def get_gen_profile(self, year):
-        ts_data_path = self.system.system_dir / "timeseries_data_files" / "Hydro" / "DAY_AHEAD_hydro.csv"
-        df = pd.read_csv(ts_data_path)
-        stamp = (pd.to_datetime(dict(year=df.Year, month=df.Month, day=df.Day))
-                 + pd.to_timedelta(df.Period - 1, unit="h"))
+        ts_data_dir = self.system.base_dir / "hydro-data" / "profiles"
+        fname = f"RTS-GMLC_profile_bus{self.node_ID}_{self.SOURCE_YEAR}.csv"
+        df_profile = pd.read_csv(ts_data_dir / f"bus{self.node_ID}" / fname, index_col=[0])
+        df_profile.index = pd.to_datetime(df_profile.index)
+        source = df_profile.squeeze()
 
-        # File is in MW; store per-unit so update_timeseries_parameters can scale
-        # by nameplate the same way it does for wind and solar.
-        source = pd.Series(df[self.name].to_numpy(dtype=float) / self.nameplate_capacity,
-                           index=stamp)
-
-        # Re-map the source calendar onto the requested year by (month, day, hour)
-        # rather than by position, so seasonality stays aligned. The source year
-        # (2020) is a leap year, so 29 Feb is available when the target needs it
-        # and simply goes unused when it does not.
+        # Re-map the source calendar onto the requested year by (month, day,
+        # hour) rather than by position, so seasonality stays aligned. The
+        # source year is a leap year, so 29 Feb is there when the target needs
+        # it and goes unused when it does not.
         source.index = pd.MultiIndex.from_arrays(
             [source.index.month, source.index.day, source.index.hour]
         )
