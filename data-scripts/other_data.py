@@ -33,12 +33,29 @@ curr_dir = pathlib.Path(__file__).resolve().parents[1]
 load_data_dir = curr_dir / "data" / "load-data"
 
 YEARS = range(2001, 2021)
-# Cooling peak as a fraction of the bus's bus.csv peak. Set so that cooling
-# lands at ~30% of the *coincident* system peak, which is how the "AC is ~30% of
-# summer peak" statistic is normally quoted. Cooling's own peak (17:00 local)
-# falls a little before and on a different day from the system peak, so a share
-# of 0.30 here would give only ~26% coincident; 0.35 gives ~30%.
-COOLING_SHARE = 0.35
+# Cooling peak as a fraction of the bus's bus.csv peak.
+#
+# Calibrated against a change-point regression (demand on area-mean temperature,
+# with hour-of-day effects) of 2019 EIA hourly demand. The temperature-sensitive
+# component is ~48% of coincident peak and ~17% of annual energy for the EIA "SW"
+# region, and our baseline profiles reproduce that almost exactly (46.4% / 17.1%),
+# which is unsurprising since they were XGBoost-trained on SW demand.
+#
+# That regression is an UPPER bound: it attributes all temperature-correlated load
+# to cooling, and some commercial/industrial load tracks temperature for other
+# reasons. 0.55 would match it exactly; 0.50 is deliberately conservative.
+#
+#   share  cool@peak  cool/yr  other Jul/Jan   (sweep over 2001-2020)
+#    0.35     30.3%     10.8%       1.23
+#    0.50     43.2%     15.4%       1.07     <- chosen
+#    0.55     47.6%     16.9%       1.02
+#    0.65     56.2%     20.0%       0.92
+#
+# The Jul/Jan column is the seasonal flatness of the residual: a genuine
+# non-thermal load should be roughly flat across seasons, and nothing in the
+# construction forces it, so it is independent corroboration. Feasibility is not
+# binding -- no bus goes negative even at 0.65.
+COOLING_SHARE = 0.50
 
 
 def read_profile(bus, pattern, years):

@@ -36,9 +36,37 @@ peaks_file = curr_dir / "data" / "load-data" / "load_peaks.csv"
 # dynamically, but that model is not built yet.
 VOLL = {"baseline": 1e4, "cooling": 1e4, "other": 1e4}
 
+# Uniform multiplier applied to every load's peak, per system config.
+#
+# RTS-ORB is deliberately made scarce. As built the system is adequate (~9.3 GW
+# dispatchable against an ~8.7 GW peak) and never sheds, so the rolling-blackout
+# model has nothing to schedule. Scaling load induces the scarcity the study
+# needs. Calibrated in analysis/scarcity_calibration.py by counting days with
+# any unserved energy across July-August, 2011-2020, DC-OPF with continuous
+# shedding:
+#
+#   factor  blackout days/yr   unserved MWh   years with none   worst year
+#     1.12          0.5                 639          7  of 10       3
+#     1.14          1.3               1,910          6              7
+#     1.15   <- chosen (interpolates to ~2/yr)
+#     1.16          3.0               5,275          2             13
+#     1.18          5.2              12,519          1             19
+#     1.20          8.8              27,187          0             30
+#
+# NOTE this is a steep curve -- a 2% load change roughly doubles the blackout
+# count -- so the factor is a consequential assumption, not a detail. Results
+# should carry a sensitivity band over roughly 1.14-1.18.
+#
+# RTS-GMLC stays unscaled so it remains a faithful representation of the
+# published test system.
+PEAK_SCALING = {"RTS-GMLC": 1.0, "RTS-ORB": 1.15}
 
-def make_load_csv(system_config="RTS-GMLC", load_types=("cooling", "other")):
+
+def make_load_csv(system_config="RTS-GMLC", load_types=("cooling", "other"),
+                  peak_scaling=None):
     src = config_dir / system_config
+    if peak_scaling is None:
+        peak_scaling = PEAK_SCALING.get(system_config, 1.0)
     df_bus = pd.read_csv(src / "bus.csv")
     bus_peaks = {int(r["Bus ID"]): r["MW Load"] for _, r in df_bus.iterrows() if r["MW Load"] > 0}
 
@@ -60,14 +88,15 @@ def make_load_csv(system_config="RTS-GMLC", load_types=("cooling", "other")):
                 "Load UID": f"{bus}_{load_type}",
                 "Bus ID": bus,
                 "Load Type": load_type,
-                "Peak MW": peak,
+                "Peak MW": peak * peak_scaling,
                 "VOLL": VOLL[load_type],
             })
 
     df_load = pd.DataFrame(rows)
     out = src / "load.csv"
     df_load.to_csv(out, index=False)
-    print(f"  {out.relative_to(curr_dir)}: {len(df_load)} rows")
+    print(f"  {out.relative_to(curr_dir)}: {len(df_load)} rows, "
+          f"peak scaling {peak_scaling:g}")
     for load_type, grp in df_load.groupby("Load Type"):
         print(f"    {load_type:8} {len(grp):3} loads, {grp["Peak MW"].sum():7.1f} MW total peak")
     return df_load

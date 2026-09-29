@@ -5,6 +5,8 @@ import cvxpy as cp
 import pathlib
 
 from component import T
+
+UNSERVED_TOL = 1e-3  # MWh; ignore LP/MILP numerical dust
 from node import Node
 from line import Line
 from load import Load
@@ -142,6 +144,26 @@ class System:
         for resource in self.hydro_resources.values():
             resource.get_gen_profile(year)
 
+    def available_days(self, year, periods=T):
+        """Dates in `year` with a full `periods`-hour window in every profile.
+
+        Profile coverage is not always complete: the 2020 NSRDB profiles end at
+        11:00 on 31 December, so that day has only 12 hours and would raise a
+        dimension error on the demand Parameter. Iterate over this rather than a
+        raw date_range.
+        """
+        index = None
+        for load in self.loads.values():
+            index = load.load_profile.index if index is None \
+                else index.intersection(load.load_profile.index)
+        for resource in list(self.variable_resources.values()) + list(self.hydro_resources.values()):
+            index = index.intersection(resource.gen_profile.index)
+
+        available = set(index)
+        offsets = [pd.Timedelta(hours=h) for h in range(periods)]
+        return [day for day in pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="D")
+                if all(day + off in available for off in offsets)]
+
     def write_opf(self):
         # Create CVXPY model
 
@@ -183,6 +205,63 @@ class System:
         result = self.prob.solve(solver=cp.GUROBI)
 
         return result
+
+    # ------------------------------------------------------------------
+    # Results reporting for the current solve
+    #
+    # All timestamps are on the UTC clock, matching the profiles. solve_opf
+    # slices T hours forward from midnight UTC, so a "day" runs 17:00 to 16:00
+    # local (UTC-7). That is fine for counting and costing, but outage *timing*
+    # should be converted before interpretation.
+    # ------------------------------------------------------------------
+
+    @property
+    def opf_index(self):
+        """Timestamps of the current solve window, UTC, tz-naive."""
+        return pd.date_range(start=self.opf_date, periods=T, freq="h")
+
+    @property
+    def unserved_energy_profile(self):
+        """(T, n_loads) MW of unserved energy, one column per load."""
+        return pd.DataFrame(
+            {name: load.unserved_energy.value for name, load in self.loads.items()},
+            index=self.opf_index,
+        )
+
+    @property
+    def blackout_schedule(self):
+        """(T, n_nodes with blackouts) binary schedule, or None in LP mode.
+
+        Columns are bus IDs, since the decision lives on the node and drives
+        every load at it.
+        """
+        if not self.has_blackouts:
+            return None
+        return pd.DataFrame(
+            {name: np.round(node.blackout.value).astype(int)
+             for name, node in self.nodes.items() if node.blackout_enabled},
+            index=self.opf_index,
+        )
+
+    @property
+    def solve_summary(self):
+        """One row of results for the current solve."""
+        ue = self.unserved_energy_profile
+        by_type = {}
+        for name, load in self.loads.items():
+            by_type[load.load_type] = by_type.get(load.load_type, 0.0) + float(ue[name].sum())
+        hourly = ue.sum(axis=1)
+        return {
+            "date": pd.Timestamp(self.opf_date),
+            "gen_cost": float(self.total_variable_costs.value),
+            "unserved_cost": float(self.total_unserved_energy_costs.value),
+            "total_cost": float(self.prob.value),
+            "load_MWh": float(sum(l.demand.value.sum() for l in self.loads.values())),
+            "unserved_MWh": float(hourly.sum()),
+            "unserved_hours": int((hourly > UNSERVED_TOL).sum()),
+            "buses_affected": int((ue.sum(axis=0) > UNSERVED_TOL).sum()),
+            **{f"unserved_{k}_MWh": v for k, v in by_type.items()},
+        }
 
     @property
     def dispatch_results(self):
