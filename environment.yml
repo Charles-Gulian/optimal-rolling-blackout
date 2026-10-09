@@ -12,4 +12,5 @@ dependencies:
   - dask
   - netcdf4
   - gurobi
+  - cvxpy
 prefix: /opt/anaconda3/envs/weather-env
