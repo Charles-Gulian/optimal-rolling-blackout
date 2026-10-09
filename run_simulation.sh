@@ -10,7 +10,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=20
 #SBATCH --mem=16G
-#SBATCH --time=4:00:00
+#SBATCH --time=8:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=charlesgulian@berkeley.edu
 

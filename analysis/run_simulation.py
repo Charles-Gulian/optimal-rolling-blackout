@@ -68,7 +68,22 @@ def lp_screen(system, years=YEARS, verbose=True):
             flagged = sum(1 for r in rows[-len(days):] if r["unserved_MWh"] > UNSERVED_TOL)
             print(f"    {year}: {len(days)} days, {flagged} flagged  "
                   f"[{time.time() - t0:.0f}s]", flush=True)
-    return pd.DataFrame(rows).set_index("date")
+    return _indexed(rows)
+
+
+def _indexed(rows):
+    """Frame of solve summaries indexed by local date, empty-safe.
+
+    A year with no blackout days at all leaves `rows` empty, and
+    pd.DataFrame([]).set_index("date") raises KeyError because there are no
+    columns to index on. Return a frame carrying an empty DatetimeIndex named
+    "date" instead, so callers can use .index.year and len() uniformly whether
+    or not anything was shed.
+    """
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame({"date": pd.to_datetime([])})
+    return df.set_index("date")
 
 
 def _longest_run(flags):
@@ -128,7 +143,7 @@ def milp_days(system, window_starts, out_dir, verbose=True):
             print(f"    {summary['date'].date()}: {summary['unserved_MWh']:8.1f} MWh, "
                   f"{summary['bus_hours_shed']:3d} bus-hours, "
                   f"{summary['unserved_hours']} h  [{summary['solve_s']:.1f}s]", flush=True)
-    return pd.DataFrame(rows).set_index("date")
+    return _indexed(rows)
 
 
 def stamp(frames, config, seed):
