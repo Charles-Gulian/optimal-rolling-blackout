@@ -7,19 +7,46 @@ import pathlib
 from component import T
 
 UNSERVED_TOL = 1e-3  # MWh; ignore LP/MILP numerical dust
+
+# All profiles are stored on the UTC clock. The system sits in Arizona (MST,
+# no DST), so local = UTC - 7. A solve window starts at LOCAL midnight, i.e.
+# 07:00 UTC, so one problem covers one whole local day.
+#
+# Why this matters: shedding concentrates 17:00-21:00 local. Starting windows
+# at 00:00 UTC (17:00 local) cut straight through that block, so a single
+# real outage running e.g. 15:00-20:00 local was split across two independent
+# problems -- each solved with the thermal state reset to setpoint. That
+# understated discomfort on exactly the longest outages, which are the ones
+# the dynamic VOLL model turns on.
+LOCAL_UTC_OFFSET = pd.Timedelta(hours=-7)
 from node import Node
 from line import Line
-from load import Load
-from resource import ThermalResource, VariableResource, HydroResource, StorageResource
+from load import CoolingLoad, Load
+from resources import ThermalResource, VariableResource, HydroResource, StorageResource
 
 
 class System:
-    def __init__(self, base_dir, system_dir, system_config):
+    def __init__(self, base_dir, system_dir, system_config,
+                 forced_outages=True, scenario_seed=0, dynamic_voll=False):
 
         # Save base directory, system directory
         self.base_dir = base_dir
         self.system_dir = system_dir
         self.system_config = system_config
+
+        # Forced outages. Sampled per unit-year from a seed, so a given
+        # scenario_seed always reproduces the same draw; change it for an
+        # independent Monte Carlo replication.
+        self.forced_outages = forced_outages
+        self.scenario_seed = scenario_seed
+
+        # Extra kwargs passed to every prob.solve(). Set Threads=1 when
+        # running a process pool: Gurobi defaults to one thread per core, so
+        # N workers each grabbing N threads oversubscribe badly -- measured
+        # 0.159 s/day solo against 0.222 s/day with only 3 workers on 8 cores.
+        self.solver_options = {}
+
+
 
         # Current date for OPF dispatch results (placeholder)
         self.opf_date = None
@@ -33,7 +60,11 @@ class System:
         # Select unit types
         unit_types = ["CT", "STEAM", "CC", "NUCLEAR", "PV", "RTPV", "WIND", "HYDRO", "ROR", "STORAGE"]
         # Select columns
-        columns = ["Bus ID", "Unit Type", "Category", "Fuel", "Fuel Price $/MMBTU", "HR_avg_0", "VOM", "PMax MW", "PMin MW", "Ramp Rate MW/Min", "FOR", "Storage Roundtrip Efficiency"]
+        columns = ["Bus ID", "Unit Type", "Category", "Fuel", "Fuel Price $/MMBTU", "HR_avg_0", "VOM", "PMax MW", "PMin MW", "Ramp Rate MW/Min", "FOR", "MTTR Hr", "Storage Roundtrip Efficiency"]
+        # Configs we derive ourselves carry an explicit Resource ID; the
+        # pristine upstream RTS-GMLC does not.
+        if "Resource ID" in df_gen.columns:
+            columns = columns + ["Resource ID"]
         # Get final resource input data
         df_gen = df_gen.loc[df_gen["Unit Type"].isin(unit_types), columns]
 
@@ -42,10 +73,16 @@ class System:
         for node in df_bus.index:
             self.nodes[node] = Node.from_series(df_bus.loc[node])
 
-        # 2. Instantiate loads (one row per bus and load type in load.csv)
+        # 2. Instantiate loads (one row per bus and load type in load.csv).
+        #    Cooling gets its own class because it carries the Wang thermal
+        #    state; every other type is a plain flat-VOLL Load.
+        load_classes = {"cooling": CoolingLoad}
         self.loads = {}
         for load in df_load.index:
-            self.loads[load] = Load.from_series(df_load.loc[load])
+            cls = load_classes.get(df_load.loc[load, "Load Type"], Load)
+            self.loads[load] = cls.from_series(df_load.loc[load])
+        if dynamic_voll:
+            self.enable_dynamic_voll()
 
         # 3. Instantiate lines
         self.lines = {}
@@ -72,7 +109,24 @@ class System:
             elif unit_type in storage_resource_types:
                 self.storage_resources[resource] = StorageResource.from_series(df_gen.loc[resource])
 
-        # 5. Link various components
+        # 5. Unit indices for reproducible outage seeding. gen.csv carries an
+        #    explicit Resource ID, assigned once when the config is derived and
+        #    inherited unchanged by configs derived from it, so the same
+        #    physical unit draws the same outages in every config it appears in
+        #    (common random numbers) and reliability differences between
+        #    configs are purely structural.
+        #
+        #    Sorted position will NOT do: it is a unit's rank in the name list,
+        #    so inserting or dropping one unit slides every unit after it into
+        #    a different RNG stream.
+        if "Resource ID" in df_gen.columns:
+            for name in self.resources:
+                self.resources[name].unit_index = int(df_gen.loc[name, "Resource ID"])
+        else:
+            for index, name in enumerate(sorted(self.resources)):
+                self.resources[name].unit_index = index
+
+        # 6. Link various components
         for obj in self.components:
             obj.link_system(self) # Link component to system
         for load in self.loads.values():
@@ -100,6 +154,31 @@ class System:
             nodes = [name for name, node in self.nodes.items() if node.loads]
         for name in nodes:
             self.nodes[name].blackout_enabled = True
+
+    @property
+    def dynamic_voll(self):
+        return any(load.dynamic_voll for load in self.loads.values())
+
+    def enable_dynamic_voll(self):
+        """Price cooling load at VOLL + rho * (excess over the comfort knee).
+
+        Affects only loads that are both CoolingLoad and carry a full set of
+        Wang parameters in load.csv; everything else keeps its flat VOLL, so
+        this is a no-op for "other" load either way.
+
+        Needs binary blackouts -- the McCormick envelope for w = s * z is
+        exact only for binary z -- so call enable_blackouts() as well. Like
+        enable_blackouts, call before write_opf(): the problem is rebuilt from
+        the components, so flipping this afterwards has no effect.
+        """
+        for load in self.loads.values():
+            if isinstance(load, CoolingLoad) and load.has_thermal_model:
+                load.dynamic_voll = True
+
+    def disable_dynamic_voll(self):
+        for load in self.loads.values():
+            if isinstance(load, CoolingLoad):
+                load.dynamic_voll = False
 
     def disable_blackouts(self):
         for node in self.nodes.values():
@@ -139,18 +218,31 @@ class System:
     def read_timeseries(self, year):
         for load in self.loads.values():
             load.get_load_profile(year)
+            if load.dynamic_voll:
+                load.get_temperature_profile(year)   # CoolingLoad only
         for resource in self.variable_resources.values():
             resource.get_gen_profile(year)
         for resource in self.hydro_resources.values():
             resource.get_gen_profile(year)
+        for resource in self.resources.values():
+            if self.forced_outages:
+                resource.get_outage_profile(year, self.scenario_seed)
+            else:
+                resource.outage_profile = None
 
     def available_days(self, year, periods=T):
-        """Dates in `year` with a full `periods`-hour window in every profile.
+        """Window starts in `year` with a full `periods`-hour span in every profile.
 
-        Profile coverage is not always complete: the 2020 NSRDB profiles end at
-        11:00 on 31 December, so that day has only 12 hours and would raise a
-        dimension error on the demand Parameter. Iterate over this rather than a
-        raw date_range.
+        Returns UTC timestamps at LOCAL midnight (07:00 UTC), so each window
+        covers one local calendar day, 00:00-23:00 local.
+
+        Profile coverage is not always complete, and the coverage test here
+        handles two cases at once. The 2020 NSRDB profiles end at 11:00 on 31
+        December, so that day is short. And because local midnight is 07:00
+        UTC, the last local day of any year needs 6 hours from the following
+        year's file, which is not loaded -- so it drops out too. That costs
+        one day per year (20 of 7305, 0.3%) and is why the year totals are a
+        day short of the calendar.
         """
         index = None
         for load in self.loads.values():
@@ -161,7 +253,10 @@ class System:
 
         available = set(index)
         offsets = [pd.Timedelta(hours=h) for h in range(periods)]
-        return [day for day in pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="D")
+        # Local midnight on local date D == D 00:00 UTC minus the offset.
+        starts = (pd.date_range(f"{year}-01-01", f"{year}-12-31", freq="D")
+                  - LOCAL_UTC_OFFSET)
+        return [day for day in starts
                 if all(day + off in available for off in offsets)]
 
     def write_opf(self):
@@ -186,7 +281,11 @@ class System:
 
         # Get total system variable costs
         self.total_variable_costs = cp.sum(cp.sum([cp.multiply(r.variable_costs, r.p_out) for r in self.resources.values()]))
-        self.total_unserved_energy_costs = cp.sum(cp.sum([l.VOLL * l.unserved_energy for l in self.loads.values()]))
+        # Each Load prices its own unserved energy: flat VOLL, or the
+        # McCormick-linearised dynamic VOLL when it has a thermal model and
+        # the toggle is on. Built after the constraints loop, since the
+        # dynamic form needs the McCormick variables to exist.
+        self.total_unserved_energy_costs = cp.sum([l.cost_expression() for l in self.loads.values()])
         self.total_cost = self.total_variable_costs + self.total_unserved_energy_costs # + startup costs + ... etc.
         self.objective = cp.Minimize(self.total_cost)
 
@@ -202,17 +301,18 @@ class System:
             obj.update_timeseries_parameters(date)
 
         # Solve model
-        result = self.prob.solve(solver=cp.GUROBI)
+        result = self.prob.solve(solver=cp.GUROBI, **self.solver_options)
 
         return result
 
     # ------------------------------------------------------------------
     # Results reporting for the current solve
     #
-    # All timestamps are on the UTC clock, matching the profiles. solve_opf
-    # slices T hours forward from midnight UTC, so a "day" runs 17:00 to 16:00
-    # local (UTC-7). That is fine for counting and costing, but outage *timing*
-    # should be converted before interpretation.
+    # Timestamps are on the UTC clock, matching the profiles. solve_opf slices
+    # T hours forward from LOCAL midnight (07:00 UTC), so a "day" is one whole
+    # local day. `date` in solve_summary is the local calendar date; opf_index
+    # stays in UTC, so convert with LOCAL_UTC_OFFSET before reading timing off
+    # it.
     # ------------------------------------------------------------------
 
     @property
@@ -252,14 +352,30 @@ class System:
             by_type[load.load_type] = by_type.get(load.load_type, 0.0) + float(ue[name].sum())
         hourly = ue.sum(axis=1)
         return {
-            "date": pd.Timestamp(self.opf_date),
+            # Two views of the same instant, because they are used for
+            # different things and conflating them has bitten us once already.
+            #
+            # window_start is where the solve actually begins, in UTC. It is
+            # what you pass back to update_timeseries_parameters() to re-solve
+            # this day -- the profiles are sliced forward from it.
+            #
+            # date is the local calendar day, for labelling results. opf_date
+            # is local midnight expressed in UTC, so shifting back by the
+            # offset and truncating gives the local day the outage belongs to.
+            "window_start": pd.Timestamp(self.opf_date),
+            "date": pd.Timestamp(self.opf_date + LOCAL_UTC_OFFSET).normalize(),
             "gen_cost": float(self.total_variable_costs.value),
             "unserved_cost": float(self.total_unserved_energy_costs.value),
             "total_cost": float(self.prob.value),
             "load_MWh": float(sum(l.demand.value.sum() for l in self.loads.values())),
             "unserved_MWh": float(hourly.sum()),
             "unserved_hours": int((hourly > UNSERVED_TOL).sum()),
-            "buses_affected": int((ue.sum(axis=0) > UNSERVED_TOL).sum()),
+            # Distinct BUSES, not loads. `ue` has one column per load and
+            # every bus carries two (cooling and other), so counting columns
+            # double-counts -- which it silently did until 2026-10-08.
+            "buses_affected": len({self.loads[name].node_ID
+                                   for name in ue.columns
+                                   if ue[name].sum() > UNSERVED_TOL}),
             **{f"unserved_{k}_MWh": v for k, v in by_type.items()},
         }
 

@@ -3,6 +3,7 @@ import pandas as pd
 import cvxpy as cp
 
 from component import Component, T
+from outages import forced_outage_profile, outage_seed
 
 
 class Resource(Component):
@@ -19,8 +20,41 @@ class Resource(Component):
         self.pmax = data["PMax MW"]  # Nameplate capacity (MW)
         self.VOM = data["VOM"]  # Variable O&M costs ($/MWh)
 
+        self.nameplate_capacity = data["PMax MW"]  # pmax is overwritten by a
+        # cp.Parameter once the model is built, so keep the constant separately
+
+        # Forced outages. FOR = 0 means the unit is never forcibly out -- true
+        # upstream for PV, RTPV, WIND and STORAGE, whose availability is already
+        # carried by their profiles.
+        self.FOR = float(data.get("FOR", 0.0) or 0.0)
+        self.MTTR = float(data.get("MTTR Hr", 0.0) or 0.0)
+        self.unit_index = None      # set by System, for reproducible seeding
+        self.outage_profile = None
+
         # Initialize node
         self.node = None
+
+    @property
+    def has_forced_outages(self):
+        return self.FOR > 0.0 and self.MTTR > 0.0
+
+    def get_outage_profile(self, year, scenario_seed=0):
+        """Sample this unit's hourly availability for `year` (1 = up, 0 = out)."""
+        if not self.has_forced_outages:
+            self.outage_profile = None
+            return
+        index = pd.date_range(f"{year}-01-01 00:00:00", f"{year}-12-31 23:00:00", freq="h")
+        rng = np.random.default_rng(outage_seed(self.unit_index, year, scenario_seed))
+        self.outage_profile = pd.Series(
+            forced_outage_profile(self.FOR, self.MTTR, len(index), rng).astype(float),
+            index=index,
+        )
+
+    def availability(self, date: pd.Timestamp):
+        """(T,) availability over the solve window; all ones if never out."""
+        if self.outage_profile is None:
+            return np.ones(T)
+        return self.outage_profile.loc[date:date + pd.Timedelta(hours=T - 1)].to_numpy()
 
     @classmethod
     def from_series(cls, df: pd.Series):
@@ -54,7 +88,14 @@ class ThermalResource(Resource):
         # Operational attributes
         self.pmin = data["PMin MW"]  # Minimum output (for unit commitment
         self.ramp_rate = 60 * data["Ramp Rate MW/Min"]
-        self.FOR = data["FOR"]
+
+    def create_parameters(self):
+        # Time-varying so forced outages can zero it out. Without outages this
+        # is just the nameplate repeated.
+        self.pmax = cp.Parameter(T, nonneg=True)
+
+    def update_timeseries_parameters(self, date: pd.Timestamp):
+        self.pmax.value = self.nameplate_capacity * self.availability(date)
 
 
 class VariableResource(Resource):
@@ -98,7 +139,8 @@ class VariableResource(Resource):
         self.pmax = cp.Parameter(T)
 
     def update_timeseries_parameters(self, date: pd.Timestamp):
-        self.pmax.value = self.nameplate_capacity * self.gen_profile.loc[date:date + pd.Timedelta(hours=T - 1)].values
+        profile = self.gen_profile.loc[date:date + pd.Timedelta(hours=T - 1)].values
+        self.pmax.value = self.nameplate_capacity * profile * self.availability(date)
 
 
 class HydroResource(VariableResource):
