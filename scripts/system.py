@@ -27,7 +27,7 @@ from resources import ThermalResource, VariableResource, HydroResource, StorageR
 
 class System:
     def __init__(self, base_dir, system_dir, system_config,
-                 forced_outages=True, scenario_seed=0, dynamic_voll=False):
+                 forced_outages=True, scenario_seed=0, voll_model="static"):
 
         # Save base directory, system directory
         self.base_dir = base_dir
@@ -81,8 +81,8 @@ class System:
         for load in df_load.index:
             cls = load_classes.get(df_load.loc[load, "Load Type"], Load)
             self.loads[load] = cls.from_series(df_load.loc[load])
-        if dynamic_voll:
-            self.enable_dynamic_voll()
+        if voll_model != "static":
+            self.set_voll_model(voll_model)
 
         # 3. Instantiate lines
         self.lines = {}
@@ -155,30 +155,41 @@ class System:
         for name in nodes:
             self.nodes[name].blackout_enabled = True
 
+    VOLL_MODELS = ("static", "exogenous", "dynamic")
+
     @property
-    def dynamic_voll(self):
-        return any(load.dynamic_voll for load in self.loads.values())
+    def voll_model(self):
+        """The VOLL model in force, or "mixed" if loads disagree."""
+        models = {load.voll_model for load in self.loads.values()
+                  if isinstance(load, CoolingLoad)}
+        if len(models) == 1:
+            return models.pop()
+        return "mixed" if models else "static"
 
-    def enable_dynamic_voll(self):
-        """Price cooling load at VOLL + rho * (excess over the comfort knee).
+    def set_voll_model(self, model):
+        """Choose how cooling load prices unserved energy.
 
-        Affects only loads that are both CoolingLoad and carry a full set of
-        Wang parameters in load.csv; everything else keeps its flat VOLL, so
-        this is a no-op for "other" load either way.
+            static      v_t = VOLL                                flat
+            exogenous   v_t = VOLL + rho c phi_t                  weather only
+            dynamic     v_t = VOLL + rho (kappa x_t + c phi_t)     + outage history
 
-        Needs binary blackouts -- the McCormick envelope for w = s * z is
-        exact only for binary z -- so call enable_blackouts() as well. Like
-        enable_blackouts, call before write_opf(): the problem is rebuilt from
-        the components, so flipping this afterwards has no effect.
+        Applies only to CoolingLoad instances carrying a full set of Wang
+        parameters; every other load keeps its flat VOLL, so this is a no-op
+        for "other" load.
+
+        "dynamic" needs binary blackouts, since the McCormick envelope for
+        w = x z is exact only for binary z. "exogenous" does not -- it has no
+        bilinear term -- but it does need the blackout variable to price
+        z_t, so call enable_blackouts() for both.
+
+        Like enable_blackouts, call before write_opf(): the problem is rebuilt
+        from the components, so changing this afterwards has no effect.
         """
+        if model not in self.VOLL_MODELS:
+            raise ValueError(f"voll_model must be one of {self.VOLL_MODELS}, got {model!r}")
         for load in self.loads.values():
             if isinstance(load, CoolingLoad) and load.has_thermal_model:
-                load.dynamic_voll = True
-
-    def disable_dynamic_voll(self):
-        for load in self.loads.values():
-            if isinstance(load, CoolingLoad):
-                load.dynamic_voll = False
+                load.voll_model = model
 
     def disable_blackouts(self):
         for node in self.nodes.values():
@@ -218,7 +229,7 @@ class System:
     def read_timeseries(self, year):
         for load in self.loads.values():
             load.get_load_profile(year)
-            if load.dynamic_voll:
+            if load.voll_model != "static" and load.needs_thermal:
                 load.get_temperature_profile(year)   # CoolingLoad only
         for resource in self.variable_resources.values():
             resource.get_gen_profile(year)

@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import cvxpy as cp
 
+import thermal
 from component import Component, T
 
 
@@ -29,7 +30,7 @@ class Load(Component):
 
     # Overridden per instance by subclasses that support it. Declared here so
     # System can read it off any load without an isinstance check.
-    dynamic_voll = False
+    voll_model = "static"
 
     def __init__(self, name, data):
         super().__init__()
@@ -64,6 +65,11 @@ class Load(Component):
         df_load.index = pd.to_datetime(df_load.index)
         self.load_profile = df_load.squeeze()
 
+    @property
+    def needs_thermal(self):
+        """True when this load's VOLL model needs phi (hence temperature)."""
+        return False
+
     def create_parameters(self):
         self.demand = cp.Parameter(T, nonneg=True)
 
@@ -82,27 +88,30 @@ class Load(Component):
 
 
 class CoolingLoad(Load):
-    """Cooling demand, optionally priced at a VOLL that rises as the house heats.
+    """Cooling demand, priced under one of three VOLL models.
 
-    With `dynamic_voll` off this behaves exactly like a plain Load. With it on,
-    the load carries the Wang et al. (2021) ERL 16 074003 1R-1C thermal state
-    and prices unserved energy at
+    All three price the same quantity -- energy not served, valued at the
+    temperature excess the household experiences over the hour it goes without
+    -- and differ only in which arguments v is allowed to see:
 
-        v_t = VOLL + rho * x_t
+        static      v_t = VOLL                                   flat
+        exogenous   v_t = VOLL + rho (c phi_t)                   weather only
+        dynamic     v_t = VOLL + rho (kappa x_t + c phi_t)       + outage history
 
-    where x_t is indoor temperature excess over setpoint, floored at zero by
-    the thermostat. Shedding a bus that has already been dark for hours
-    therefore costs more than shedding a cool one, which is what makes rolling
-    the blackout worth something.
+    x_t is the excess the household INHERITS entering hour t, carried by the
+    Wang et al. (2021) ERL 16 074003 1R-1C state. Shedding a bus that has
+    already been dark therefore costs more than shedding a cool one, which is
+    what makes rolling the blackout worth something -- and the exogenous model
+    is blind to exactly that, so the gap between the two isolates the value of
+    knowing history.
 
-    Discomfort starts AT the setpoint: there is no separate threshold, because
-    choosing a setpoint is itself a statement that you would rather not be
-    warmer. Wang's 28 degC overheating limit is a health threshold and a
-    different quantity. Dropping it also removes a variable -- with a knee at
-    zero the hinge max(0, x - x_thr) collapses to x.
+    Discomfort starts AT the setpoint, with no separate threshold: choosing a
+    setpoint is itself a statement that you would rather not be warmer. Wang's
+    28 degC overheating limit is a health threshold and a different quantity.
 
-    See scripts/thermal.py for the derivation of the dynamics, and
-    data-scripts/make_load_csv.py for where each parameter comes from.
+    scripts/thermal.py owns the dynamics; this class only builds the
+    optimisation around them. data-scripts/make_load_csv.py documents where
+    each parameter comes from.
     """
 
     def __init__(self, name, data):
@@ -114,8 +123,8 @@ class CoolingLoad(Load):
         self.t_eq = self._opt(data, "T Eq degC")       # degC, solar+internal gains
         self.rho = self._opt(data, "Rho $/MWh/degC")   # $/MWh per degC of excess
 
-        self.dynamic_voll = False   # System.enable_dynamic_voll() flips this
-        self.temperature = None     # degC dry-bulb, UTC clock
+        self.voll_model = "static"   # System.set_voll_model() changes this
+        self.temperature = None      # degC dry-bulb, UTC clock
 
     @staticmethod
     def _opt(data, key):
@@ -132,9 +141,33 @@ class CoolingLoad(Load):
                    ("tau", "gbar", "t_set", "t_eq", "rho"))
 
     @property
+    def needs_thermal(self):
+        """True when this load's VOLL model needs phi (hence temperature)."""
+        return self.voll_model in ("exogenous", "dynamic") and self.has_thermal_model
+
+    @property
     def a(self):
         """Retention exp(-1/tau): fraction of the gap to T_eff surviving 1 h."""
-        return float(np.exp(-1.0 / self.tau))
+        return float(thermal.retention(self.tau))
+
+    @property
+    def kappa(self):
+        """Weight on inherited stress in the hour-average. See thermal.py.
+
+        The memory term: 1 means the house keeps everything it had, 0 means it
+        forgets within the hour, at which point dynamic VOLL collapses into
+        the exogenous model. 0.9674 at tau = 15 h.
+        """
+        return float(thermal.hour_average_weights(self.tau)[0])
+
+    @property
+    def c(self):
+        """Weight on this hour's forcing in the hour-average. See thermal.py.
+
+        0.5056 at tau = 15 h, which is why phi_t/2 is a good approximation
+        here and a poor one for a leaky house.
+        """
+        return float(thermal.hour_average_weights(self.tau)[1])
 
     def get_temperature_profile(self, year):
         """Hourly dry-bulb at this bus, degC, on the UTC clock.
@@ -153,57 +186,40 @@ class CoolingLoad(Load):
 
     def create_parameters(self):
         super().create_parameters()
-        if self.dynamic_voll:
+        if self.needs_thermal:
             # phi_t: degC/h the house heats with the AC off.
             self.phi = cp.Parameter(T, nonneg=True)
-            # x_max,t: tightest valid upper bound on the state, needed by the
-            # McCormick envelope. Time-varying, so the envelope is much
-            # tighter than a horizon-wide constant would give.
+            # d_t * phi_t, precomputed. The cost needs this product, and
+            # multiplying two Parameters together is not DPP -- CVXPY would
+            # recompile on every solve, defeating the compile-once design.
+            self.d_phi = cp.Parameter(T, nonneg=True)
+        if self.voll_model == "dynamic":
+            # Tightest valid upper bound on the state, for the McCormick
+            # envelope. Time-varying, so much tighter than a constant.
             self.x_max = cp.Parameter(T, nonneg=True)
 
     def create_variables(self):
         super().create_variables()
-        if self.dynamic_voll:
-            self.x = cp.Variable(T, nonneg=True)   # indoor excess over setpoint
+        if self.voll_model == "dynamic":
+            self.x = cp.Variable(T, nonneg=True)   # excess entering each hour
             self.w = cp.Variable(T, nonneg=True)   # McCormick: w = x * z
 
     def update_timeseries_parameters(self, date: pd.Timestamp):
         super().update_timeseries_parameters(date)
-        if not self.dynamic_voll:
+        if not self.needs_thermal:
             return
-        # phi_t = (1-a)(T_eff,t - T_set), T_eff = dry-bulb + T_eq.
-        # Clipped at zero: below setpoint there is no cooling season and the
-        # model does not apply. Keeping negative forcing would let the house
-        # drift below setpoint -- which the thermostat prevents in reality,
-        # and which would break the monotonicity that licenses the inequality
-        # form of the dynamics.
         t_out = self.temperature.loc[date:date + pd.Timedelta(hours=T - 1)].values
-        self.phi.value = np.maximum(
-            0.0, (1.0 - self.a) * (t_out + self.t_eq - self.t_set))
-        self.x_max.value = self._state_bound(self.phi.value)
-
-    def _state_bound(self, phi):
-        """(T,) upper bound on the state x_t, for the McCormick envelope.
-
-        Cooling never raises x and a >= 0, so the never-served trajectory
-        (g == 0 throughout) dominates every schedule by induction:
-
-            x_max,t = sum_{k<t} a^(t-1-k) phi_k
-
-        That is the exact never-served path, so the bound is attained, not
-        merely valid -- which matters twice over. Too loose and the LP
-        relaxation weakens; too tight and `w >= x - x_max (1-z)` would go
-        positive at z = 0, charging outage cost to a bus that never went dark.
-        """
-        a, x, out = self.a, 0.0, np.zeros(T)
-        for t in range(T):
-            out[t] = x
-            x = a * x + phi[t]
-        return out
+        self.phi.value = thermal.forcing(t_out, self.t_eq, self.t_set, self.a)
+        self.d_phi.value = self.demand.value * self.phi.value
+        if self.voll_model == "dynamic":
+            self.x_max.value = thermal.state_bound(self.phi.value, self.a)
 
     def write_constraints(self):
         constraints = super().write_constraints()
-        if not self.dynamic_voll:
+        # Only the dynamic model carries state. The exogenous model prices
+        # phi_t alone, which is a Parameter, so it needs no variables, no
+        # dynamics and no McCormick envelope -- it stays a plain MILP.
+        if self.voll_model != "dynamic":
             return constraints
 
         z = self.node.blackout   # (T,) binary, 1 = bus de-energised
@@ -212,20 +228,22 @@ class CoolingLoad(Load):
                 f"{self.name}: dynamic VOLL needs the bus blackout binary. "
                 f"Call System.enable_blackouts() before write_opf().")
 
-        # 1. Thermal state. Exact dynamics are
-        #        x_{t+1} = max(0, a x_t + phi_t - gbar (1 - z_t)),
-        #    relaxed to >=. The relaxation is tight because the objective is
-        #    nondecreasing in x (via s, then w) whenever rho >= 0, so the
-        #    minimiser drives every x_t down onto its floor. z enters
-        #    ADDITIVELY, not multiplicatively, because the AC is rate-limited;
-        #    assuming instantaneous recovery to setpoint would give
+        # 1. Thermal state, HOUR-BEGINNING convention:
+        #        x_{t+1} = max(0, a x_t + phi_t - gbar (1 - z_t))
+        #    so x_t is what the household inherits entering hour t, fixed by
+        #    history up to t-1, and the cost below prices this hour's demand
+        #    at that inherited stress. Charging x_{t+1} would multiply this
+        #    hour's demand by next hour's stress.
+        #
+        #    Relaxed to >=, tight because the objective is nondecreasing in x
+        #    whenever rho >= 0, so the minimiser drives every x_t onto its
+        #    floor. z enters ADDITIVELY because the AC is rate-limited;
+        #    assuming instantaneous recovery would give
         #    x_{t+1} = z_t (a x_t + phi_t), bilinear and far harder.
-        #    x_0 = 0: each day starts at setpoint. Overnight recovery is fast
-        #    relative to a day, so intra-day carryover is the part that counts.
-        constraints += [self.x[0] >= self.phi[0] - self.gbar * (1 - z[0])]
+        constraints += [self.x[0] == 0.0]   # at setpoint entering the day
         constraints += [
-            self.x[1:] >= self.a * self.x[:-1] + self.phi[1:]
-            - self.gbar * (1 - z[1:])
+            self.x[1:] >= self.a * self.x[:-1] + self.phi[:-1]
+            - self.gbar * (1 - z[:-1])
         ]
 
         # 2. McCormick envelope for w = x * z, exact for binary z given
@@ -240,43 +258,52 @@ class CoolingLoad(Load):
         return constraints
 
     def thermal_trajectory(self):
-        """(T,) exact indoor excess over setpoint, rolled forward from solved z.
+        """(T,) exact hour-beginning excess, rolled forward from the solved z.
 
         Use this for reporting, NOT self.x. The `>=` relaxation is tight only
-        where the objective actually sees x, i.e. on hours feeding a shed hour
-        whose discomfort clears the knee. Everywhere else the solver is
+        where the objective actually sees x; elsewhere the solver is
         indifferent and x floats anywhere above its floor -- we have measured
         it 15 degC high. That costs nothing (the objective is nondecreasing in
         x, so slack never buys anything) but makes self.x useless as a
-        diagnostic. Once z is known the exact bang-bang recursion is trivial,
-        so there is no reason to report the relaxed value.
+        diagnostic. Once z is known the recursion is exact and trivial.
         """
-        if not self.dynamic_voll:
+        if not self.needs_thermal:
             return None
-        z = np.round(self.node.blackout.value)
-        a, g, phi = self.a, self.gbar, self.phi.value
-        x, out = 0.0, np.zeros(T)
-        for t in range(T):
-            drift = (a * x if t else 0.0) + phi[t]
-            # Powered: cool toward setpoint, capped at rated capacity.
-            x = max(0.0, drift - (0.0 if z[t] > 0.5 else g))
-            out[t] = x
-        return out
+        return thermal.simulate(self.phi.value,
+                                np.round(self.node.blackout.value),
+                                self.a, self.gbar)
 
     def cost_expression(self):
-        """Unserved-energy cost, flat or thermal-state dependent.
+        """Unserved-energy cost under this load's VOLL model.
 
-        Static:   VOLL * u_t
-        Dynamic:  (VOLL + rho * x_t) * u_t
-                = VOLL * u_t + rho * d_t * x_t * z_t
-                = VOLL * u_t + rho * d_t * w_t
+        xbar_t = kappa x_t + c phi_t is the exact time-average of the excess
+        over one unserved hour (see thermal.hour_average_weights). It splits
+        into stress INHERITED from earlier outages and stress GENERATED this
+        hour by the weather. The exogenous model keeps only the second, so it
+        prices every hour as if the household entered it at setpoint --
+        correct for the first hour of any outage, progressively too cheap
+        after that.
 
-        The middle step uses u_t = d_t * z_t, which Node already enforces, and
-        the last replaces the only bilinear term with its McCormick surrogate.
-        d_t is a Parameter, so rho * d_t * w_t is affine in w and the problem
-        stays a MILP.
+        Expanding v_t * u_t with u_t = d_t z_t, which Node enforces:
+
+            VOLL u_t  +  rho kappa d_t w_t  +  rho c (d_t phi_t) z_t
+
+        with w_t = x_t z_t from the McCormick envelope. Both products are
+        Parameter-times-Variable, so the objective is affine and the problem
+        stays a MILP. d_t phi_t is precomputed into one Parameter because a
+        product of two Parameters is not DPP.
         """
         cost = super().cost_expression()
-        if self.dynamic_voll:
-            cost = cost + cp.sum(self.rho * cp.multiply(self.demand, self.w))
+        if self.voll_model == "static":
+            return cost
+        if self.voll_model not in ("exogenous", "dynamic"):
+            raise ValueError(f"{self.name}: unknown voll_model {self.voll_model!r}")
+
+        # Flow term: present in both exogenous and dynamic.
+        cost = cost + self.rho * self.c * cp.sum(
+            cp.multiply(self.d_phi, self.node.blackout))
+        # State term: dynamic only.
+        if self.voll_model == "dynamic":
+            cost = cost + self.rho * self.kappa * cp.sum(
+                cp.multiply(self.demand, self.w))
         return cost
