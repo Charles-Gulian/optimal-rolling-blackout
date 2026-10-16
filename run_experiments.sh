@@ -14,7 +14,8 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=charlesgulian@berkeley.edu
 
-# RUN_NAME, CATALOG and EXTRA_ARGS are injected by submit_experiments.sh
+# RUN_NAME, CATALOG, VOLL_MODELS and EXTRA_ARGS are injected by
+# submit_experiments.sh
 SCRATCH=/global/scratch/users/charlesgulian/optimal-rolling-blackout
 RESULTS=$SCRATCH/results/experiments/$RUN_NAME
 
@@ -32,6 +33,7 @@ echo "=========================================="
 echo "Job ID:      $SLURM_JOB_ID"
 echo "Run name:    $RUN_NAME"
 echo "Catalog:     $CATALOG"
+echo "Policies:    $VOLL_MODELS"
 echo "Results dir: $RESULTS"
 echo "Workers:     $SLURM_CPUS_PER_TASK"
 echo "Start time:  $(date)"
@@ -48,7 +50,7 @@ echo "=========================================="
 python analysis/run_experiments.py \
     --catalog     $CATALOG            \
     --configs     RTS-ORB RTS-ORB-HR  \
-    --voll-models dynamic exogenous   \
+    --voll-models $VOLL_MODELS        \
     --n-workers   $SLURM_CPUS_PER_TASK \
     --out-root    $RESULTS            \
     $EXTRA_ARGS

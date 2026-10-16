@@ -9,9 +9,15 @@
 #
 # Examples:
 #   bash submit_experiments.sh voll-ladder
+#   VOLL_MODELS="static static_calibrated" bash submit_experiments.sh voll-flat
 #   bash submit_experiments.sh voll-smoke  --configs RTS-ORB --seeds 3 --years 2003
 #   bash submit_experiments.sh voll-ladder --force
 #   CATALOG_RUN=orb-100yr bash submit_experiments.sh voll-ladder
+#
+# VOLL_MODELS defaults to "dynamic exogenous". Valid: static,
+# static_calibrated, exogenous, dynamic. static_calibrated needs
+# voll_static_calibrated.csv, which make_voll.py writes only from a completed
+# dynamic run.
 #
 # All options after <run_name> are forwarded to analysis/run_experiments.py.
 #
@@ -39,6 +45,7 @@ shift
 SCRATCH=/global/scratch/users/charlesgulian/optimal-rolling-blackout
 CATALOG_RUN=${CATALOG_RUN:-orb-100yr}
 CATALOG=$SCRATCH/results/$CATALOG_RUN
+VOLL_MODELS=${VOLL_MODELS:-"dynamic exogenous"}
 
 # Fail now rather than after the job queues: without the catalog there is
 # nothing to re-solve.
@@ -56,11 +63,12 @@ mkdir -p $SCRATCH/results/experiments/$RUN
 sbatch \
     --job-name=$RUN \
     --output=$SCRATCH/logs/%j_$RUN.out \
-    --export=ALL,RUN_NAME=$RUN,CATALOG=$CATALOG,EXTRA_ARGS="$*" \
+    --export=ALL,RUN_NAME=$RUN,CATALOG=$CATALOG,VOLL_MODELS="$VOLL_MODELS",EXTRA_ARGS="$*" \
     run_experiments.sh
 
 echo "Submitted job '$RUN'"
 echo "Catalog:                  $CATALOG"
+echo "Policies:                 $VOLL_MODELS"
 echo "Results will be saved to: $SCRATCH/results/experiments/$RUN"
 echo "Log will be at:           $SCRATCH/logs/<jobid>_$RUN.out"
 echo ""

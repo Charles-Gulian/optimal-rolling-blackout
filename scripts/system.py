@@ -21,7 +21,7 @@ UNSERVED_TOL = 1e-3  # MWh; ignore LP/MILP numerical dust
 LOCAL_UTC_OFFSET = pd.Timedelta(hours=-7)
 from node import Node
 from line import Line
-from load import CoolingLoad, Load
+from load import VOLL_MODELS, CoolingLoad, Load
 from resources import ThermalResource, VariableResource, HydroResource, StorageResource
 
 
@@ -74,15 +74,36 @@ class System:
             self.nodes[node] = Node.from_series(df_bus.loc[node])
 
         # 2. Instantiate loads (one row per bus and load type in load.csv).
+        #    load.csv says what the load IS; voll_<policy>.csv says how it is
+        #    PRICED, and the two are merged on Load UID here. Keeping them
+        #    apart means a policy comparison cannot accidentally alter the
+        #    load description, so the systems compared are provably identical.
         #    Cooling gets its own class because it carries the Wang thermal
         #    state; every other type is a plain flat-VOLL Load.
+        if voll_model not in VOLL_MODELS:
+            raise ValueError(f"voll_model must be one of {VOLL_MODELS}, "
+                             f"got {voll_model!r}")
+        voll_path = system_dir / system_config / f"voll_{voll_model}.csv"
+        if not voll_path.exists():
+            raise FileNotFoundError(
+                f"{voll_path} not found. Generate it with "
+                f"data-scripts/make_voll.py" + (
+                    " --experiments <run>, which needs a completed dynamic run"
+                    if voll_model == "static_calibrated" else ""))
+        df_voll = pd.read_csv(voll_path, index_col=[0])
+        df_load = df_load.join(df_voll.drop(columns=["source"], errors="ignore"),
+                               how="left")
+        missing = df_load["VOLL"].isna()
+        if missing.any():
+            raise ValueError(f"{voll_path} has no row for "
+                             f"{list(df_load.index[missing])[:5]}")
+
         load_classes = {"cooling": CoolingLoad}
         self.loads = {}
         for load in df_load.index:
             cls = load_classes.get(df_load.loc[load, "Load Type"], Load)
             self.loads[load] = cls.from_series(df_load.loc[load])
-        if voll_model != "static":
-            self.set_voll_model(voll_model)
+        self.set_voll_model(voll_model)
 
         # 3. Instantiate lines
         self.lines = {}
@@ -155,8 +176,6 @@ class System:
         for name in nodes:
             self.nodes[name].blackout_enabled = True
 
-    VOLL_MODELS = ("static", "exogenous", "dynamic")
-
     @property
     def voll_model(self):
         """The VOLL model in force, or "mixed" if loads disagree."""
@@ -169,9 +188,14 @@ class System:
     def set_voll_model(self, model):
         """Choose how cooling load prices unserved energy.
 
-            static      v_t = VOLL                                flat
-            exogenous   v_t = VOLL + rho c phi_t                  weather only
-            dynamic     v_t = VOLL + rho (kappa x_t + c phi_t)     + outage history
+            static             v_t = VOLL                             flat, 10k
+            static_calibrated  v_t = VOLL*                            flat, ~14.8k
+            exogenous          v_t = VOLL + rho c phi_t               weather only
+            dynamic            v_t = VOLL + rho (kappa x_t + c phi_t) + history
+
+        Note the VOLL values themselves come from the voll_<policy>.csv read
+        at construction, so this only selects the pricing FORM; changing it
+        afterwards will not reload the file.
 
         Applies only to CoolingLoad instances carrying a full set of Wang
         parameters; every other load keeps its flat VOLL, so this is a no-op
@@ -185,8 +209,8 @@ class System:
         Like enable_blackouts, call before write_opf(): the problem is rebuilt
         from the components, so changing this afterwards has no effect.
         """
-        if model not in self.VOLL_MODELS:
-            raise ValueError(f"voll_model must be one of {self.VOLL_MODELS}, got {model!r}")
+        if model not in VOLL_MODELS:
+            raise ValueError(f"voll_model must be one of {VOLL_MODELS}, got {model!r}")
         for load in self.loads.values():
             if isinstance(load, CoolingLoad) and load.has_thermal_model:
                 load.voll_model = model

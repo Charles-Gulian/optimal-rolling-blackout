@@ -5,6 +5,12 @@ import cvxpy as cp
 import thermal
 from component import Component, T
 
+# How unserved energy is priced. The two flat models differ only in the VOLL
+# they read from their voll_<policy>.csv; the code path is identical.
+FLAT_MODELS = ("static", "static_calibrated")
+THERMAL_MODELS = ("exogenous", "dynamic")
+VOLL_MODELS = FLAT_MODELS + THERMAL_MODELS
+
 
 class Load(Component):
     """Electricity demand of one type at one node, priced at a flat VOLL.
@@ -94,9 +100,15 @@ class CoolingLoad(Load):
     temperature excess the household experiences over the hour it goes without
     -- and differ only in which arguments v is allowed to see:
 
-        static      v_t = VOLL                                   flat
-        exogenous   v_t = VOLL + rho (c phi_t)                   weather only
-        dynamic     v_t = VOLL + rho (kappa x_t + c phi_t)       + outage history
+        static             v_t = VOLL                              flat, 10k
+        static_calibrated  v_t = VOLL*                             flat, ~14.8k
+        exogenous          v_t = VOLL + rho (c phi_t)              weather only
+        dynamic            v_t = VOLL + rho (kappa x_t + c phi_t)  + history
+
+    The two flat models differ only in the VOLL their file supplies:
+    static_calibrated carries the price the dynamic model actually paid, so
+    comparing against it separates the value of pricing the STATE from the
+    value of merely pricing outages higher on average.
 
     x_t is the excess the household INHERITS entering hour t, carried by the
     Wang et al. (2021) ERL 16 074003 1R-1C state. Shedding a bus that has
@@ -143,7 +155,7 @@ class CoolingLoad(Load):
     @property
     def needs_thermal(self):
         """True when this load's VOLL model needs phi (hence temperature)."""
-        return self.voll_model in ("exogenous", "dynamic") and self.has_thermal_model
+        return self.voll_model in THERMAL_MODELS and self.has_thermal_model
 
     @property
     def a(self):
@@ -294,10 +306,11 @@ class CoolingLoad(Load):
         product of two Parameters is not DPP.
         """
         cost = super().cost_expression()
-        if self.voll_model == "static":
+        if self.voll_model not in VOLL_MODELS:
+            raise ValueError(f"{self.name}: unknown voll_model {self.voll_model!r}, "
+                             f"expected one of {VOLL_MODELS}")
+        if self.voll_model in FLAT_MODELS:
             return cost
-        if self.voll_model not in ("exogenous", "dynamic"):
-            raise ValueError(f"{self.name}: unknown voll_model {self.voll_model!r}")
 
         # Flow term: present in both exogenous and dynamic.
         cost = cost + self.rho * self.c * cp.sum(
