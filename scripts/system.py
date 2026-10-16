@@ -401,7 +401,10 @@ class System:
             "date": pd.Timestamp(self.opf_date + LOCAL_UTC_OFFSET).normalize(),
             "gen_cost": float(self.total_variable_costs.value),
             "unserved_cost": float(self.total_unserved_energy_costs.value),
-            "total_cost": float(self.prob.value),
+            # From the expression, not prob.value: a caller may have solved a
+            # Problem built around these same variables rather than self.prob
+            # (the lexicographic fairness policy does), leaving prob.value None.
+            "total_cost": float(self.total_cost.value),
             "load_MWh": float(sum(l.demand.value.sum() for l in self.loads.values())),
             "unserved_MWh": float(hourly.sum()),
             "unserved_hours": int((hourly > UNSERVED_TOL).sum()),

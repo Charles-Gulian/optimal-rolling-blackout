@@ -37,10 +37,23 @@ import pandas as pd
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+from fairness import solve_fair  # noqa: E402
 from system import System  # noqa: E402
 
 CONFIGS = ("RTS-ORB", "RTS-ORB-HR")
 VOLL_MODELS = ("dynamic", "exogenous")
+
+# "fair" is a rationing policy, not a VOLL model -- it is lexicographic
+# (min kmax, then min omax, then min cost) rather than a different cost
+# expression. It rides the same --voll-models flag because everything else
+# about a task is identical, which leaves that flag's name imprecise.
+#
+# Its cost stage prices unserved energy at the CALIBRATED flat VOLL, so the
+# comparison against dynamic turns on policy structure rather than on price
+# level. That makes it depend on voll_static_calibrated.csv, hence on a
+# completed dynamic run.
+FAIR = "fair"
+FAIR_BASE_MODEL = "static_calibrated"
 MIP_GAP = 1e-2
 MIP_TIME_LIMIT = 1800.0
 
@@ -53,8 +66,9 @@ _SYSTEMS = {}
 def _get_system(config, voll_model):
     key = (config, voll_model)
     if key not in _SYSTEMS:
+        built_as = FAIR_BASE_MODEL if voll_model == FAIR else voll_model
         system = System(ROOT / "data", ROOT / "system-config", config,
-                        voll_model=voll_model)
+                        voll_model=built_as)
         system.solver_options = {"Threads": 1}
         system.enable_blackouts()      # needed by every model: z prices the outage
         system.write_opf()
@@ -87,11 +101,27 @@ def run_task(config, voll_model, seed, year, window_starts, out_root, force=Fals
         for obj in system.components:
             obj.update_timeseries_parameters(ws)
         t0 = time.time()
+        kw = dict(solver=cp.GUROBI, MIPGap=MIP_GAP,
+                  TimeLimit=MIP_TIME_LIMIT, **system.solver_options)
+        extra = {}
         try:
-            system.prob.solve(solver=cp.GUROBI, MIPGap=MIP_GAP,
-                              TimeLimit=MIP_TIME_LIMIT, **system.solver_options)
-            m = system.prob.solver_stats.extra_stats
-            gap, status, nodes = float(m.MIPGap), int(m.Status), float(m.NodeCount)
+            if voll_model == FAIR:
+                # Three solves; the schedule is left in the blackout vars, as
+                # after any solve. system.prob is untouched, so read the
+                # diagnostics from what solve_fair reports instead.
+                f = solve_fair(system, kw)
+                gap, status, nodes = float("nan"), 2, float("nan")
+                extra = {"k_star": f["k_star"], "o_star": f["o_star"],
+                         "stage1_status": f["stage1_status"],
+                         "stage2_status": f["stage2_status"],
+                         "stage3_status": f["stage3_status"]}
+                if any(not str(f[k]).startswith("optimal")
+                       for k in ("stage1_status", "stage2_status", "stage3_status")):
+                    status = -2
+            else:
+                system.prob.solve(**kw)
+                m = system.prob.solver_stats.extra_stats
+                gap, status, nodes = float(m.MIPGap), int(m.Status), float(m.NodeCount)
         except Exception as exc:                            # noqa: BLE001
             rows.append({"window_start": ws, "error": repr(exc)[:200],
                          "solve_s": time.time() - t0})
@@ -104,7 +134,7 @@ def run_task(config, voll_model, seed, year, window_starts, out_root, force=Fals
         summary.update(config=config, seed=seed, voll_model=voll_model,
                        mip_gap=gap, gurobi_status=status, nodes=nodes,
                        solve_s=time.time() - t0,
-                       bus_hours_shed=int(schedule.values.sum()))
+                       bus_hours_shed=int(schedule.values.sum()), **extra)
         rows.append(summary)
         # Gurobi status 2 is OPTIMAL (tolerance met); anything else did not.
         if status != 2:
