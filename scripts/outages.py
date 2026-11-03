@@ -1,43 +1,18 @@
 """
 Forced outage sampling for generators.
-
-Each unit is a two-state Markov chain in hourly steps: available or on forced
-outage. The chain is calibrated so its stationary down-probability equals the
-unit's FOR from gen.csv and its mean down-time equals MTTR.
-
-Reproducibility
----------------
-Draws are generated on demand from a seed rather than stored. The seed for a
-unit-year is derived by Cantor pairing the unit's index with the year, then
-offset by a scenario seed, so that:
-
-  * the same scenario seed always reproduces the same outages,
-  * units and years are independent of one another,
-  * changing the scenario seed gives an independent Monte Carlo replication,
-  * adding or removing units does not reshuffle the others, provided their
-    indices are stable (we use the unit's position in a sorted list of names).
-
-Scope
------
-Only units with FOR > 0 in gen.csv are sampled: thermal (CT, STEAM, CC,
-NUCLEAR) and hydro (HYDRO, ROR). PV, RTPV, WIND and STORAGE carry FOR = 0
-upstream, since their availability is already represented by their profiles.
 """
 
 import numpy as np
 
 DEFAULT_SCENARIO_SEED = 0
 
-
 def cantor_pair(k1, k2):
     """Encode two non-negative integers as one."""
     return (k1 + k2) * (k1 + k2 + 1) // 2 + k2
 
-
 def outage_seed(unit_index, year, scenario_seed=DEFAULT_SCENARIO_SEED):
-    """Deterministic, collision-free seed for one unit-year."""
-    return cantor_pair(int(unit_index), int(year)) + int(scenario_seed)
-
+    """Deterministic, collision-free seed for one (unit, year, scenario).   """
+    return cantor_pair(cantor_pair(int(unit_index), int(year)), int(scenario_seed))
 
 def forced_outage_profile(FOR, MTTR, T, rng=None):
     """Binary hourly availability of length T. 1 = available, 0 = forced outage.

@@ -25,6 +25,7 @@ dependencies:
   - pandas=2.2.3
   - scipy=1.15.1          # cvxpy dependency
   - matplotlib-base=3.10  # system.py imports pyplot at module level
+  - tqdm
   - pip
   - pip:
       - cvxpy==1.6.3

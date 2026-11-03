@@ -5,7 +5,6 @@ import cvxpy as cp
 from component import Component, T
 from outages import forced_outage_profile, outage_seed
 
-
 class Resource(Component):
 
     def __init__(self, name, data):
@@ -123,15 +122,14 @@ class VariableResource(Resource):
         # Initialize generation profile
         self.gen_profile = None
 
+    PROFILE_SOURCE = "RTS-GMLC"
+
     def get_gen_profile(self, year):
-        # Infer resource type
-        if self.resource_type == "solar":
-            data_source = "NSRDB"
-        elif self.resource_type == "wind":
-            data_source = "WTK-LED"
-        ts_data_dir = self.system.base_dir / f"{self.resource_type}-data" / "profiles"
-        ts_data_path = ts_data_dir / f"bus{self.node_ID}" / f"{data_source}_profile_bus{self.node_ID}_{year}.csv"
-        df_profile = pd.read_csv(ts_data_path, index_col=[0])
+        """Read this generator's per-unit hourly profile, keyed by GEN UID."""
+        ts_data_dir = (self.system.base_dir / f"{self.resource_type}-data"
+                       / "profiles" / f"bus{self.node_ID}")
+        fname = f"{self.PROFILE_SOURCE}_profile_{self.name}_{year}.csv"
+        df_profile = pd.read_csv(ts_data_dir / fname, index_col=[0])
         df_profile.index = pd.to_datetime(df_profile.index)
         self.gen_profile = df_profile.squeeze()
 
@@ -144,43 +142,7 @@ class VariableResource(Resource):
 
 
 class HydroResource(VariableResource):
-    """Hydro and run-of-river.
-
-    Same dispatch behaviour as wind/solar -- zero marginal cost, capped hourly by
-    a per-unit profile -- so it inherits the parameter/variable machinery. It
-    differs only in the calendar: there is no multi-year hydro data, so every
-    simulated year re-uses the single RTS-GMLC profile, which is stamped 2020.
-
-    Profiles are built by data-scripts/hydro_data.py into the same per-bus
-    layout the NSRDB/WTK-LED profiles use.
-    """
-
-    SOURCE_YEAR = 2020
-
-    def get_gen_profile(self, year):
-        ts_data_dir = self.system.base_dir / "hydro-data" / "profiles"
-        fname = f"RTS-GMLC_profile_bus{self.node_ID}_{self.SOURCE_YEAR}.csv"
-        df_profile = pd.read_csv(ts_data_dir / f"bus{self.node_ID}" / fname, index_col=[0])
-        df_profile.index = pd.to_datetime(df_profile.index)
-        source = df_profile.squeeze()
-
-        # Re-map the source calendar onto the requested year by (month, day,
-        # hour) rather than by position, so seasonality stays aligned. The
-        # source year is a leap year, so 29 Feb is there when the target needs
-        # it and goes unused when it does not.
-        source.index = pd.MultiIndex.from_arrays(
-            [source.index.month, source.index.day, source.index.hour]
-        )
-        source = source[~source.index.duplicated()]
-
-        target = pd.date_range(f"{year}-01-01 00:00:00", f"{year}-12-31 23:00:00", freq="h")
-        key = pd.MultiIndex.from_arrays([target.month, target.day, target.hour])
-        values = source.reindex(key).to_numpy()
-        if np.isnan(values).any():
-            raise ValueError(f"{self.name}: hydro profile has gaps when re-mapped to {year}")
-
-        self.gen_profile = pd.Series(values, index=target)
-
+    """Hydro and run-of-river. Dispatches as wind and solar do."""
 
 class StorageResource(Resource):
 
@@ -198,7 +160,7 @@ class StorageResource(Resource):
     def create_variables(self):
         self.charge = cp.Variable(T, nonneg=True)
         self.discharge = cp.Variable(T, nonneg=True)
-        self.SOC = cp.Variable(T, nonneg=True)
+        self.SOC = cp.Variable(T)
 
     def create_expressions(self):
         self.p_out = self.discharge - self.charge
@@ -207,11 +169,22 @@ class StorageResource(Resource):
         constraints = [
             self.charge <= self.pmax,
             self.discharge <= self.pmax,
-            self.SOC <= self.max_SOC
+            self.SOC >= 0,
+            self.SOC <= self.max_SOC,
         ]
         constraints += [
             self.SOC[t] == self.SOC[np.mod(t - 1, T)] + self.efficiency * self.charge[np.mod(t - 1, T)]
             - self.discharge[np.mod(t - 1, T)]
             for t in range(T)
         ]
+        self.SOC_min_constraint = constraints[2]
+        self.SOC_max_constraint = constraints[3]
         return constraints
+
+    @property
+    def SOC_min_duals(self):
+        return self.SOC_min_constraint.dual_value
+
+    @property
+    def SOC_max_duals(self):
+        return self.SOC_max_constraint.dual_value

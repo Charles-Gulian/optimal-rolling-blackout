@@ -31,12 +31,6 @@ class Node(Component):
         # Initialize loads (one per load type at this node)
         self.loads = []
 
-        # Blackout decision. Off by default: when disabled the node sheds
-        # continuously (an LP), when enabled every load at the node is shed
-        # all-or-nothing together, as a feeder outage would (a MILP).
-        self.blackout_enabled = False
-        self.blackout = None
-
         # Initialize in/out lines
         self.in_lines = []
         self.out_lines = []
@@ -47,8 +41,6 @@ class Node(Component):
 
     def create_variables(self):
         self.theta = cp.Variable(T)
-        if self.blackout_enabled:
-            self.blackout = cp.Variable(T, boolean=True)
 
     def write_constraints(self):
         constraints = [
@@ -59,13 +51,10 @@ class Node(Component):
             self.theta <= self.theta_max, self.theta >= -self.theta_max  # Voltage angle limits
         ]
         self.power_balance_constraint = constraints[0]
-        if self.blackout_enabled:
-            # One decision per node drives every load at it. demand is a
-            # Parameter and blackout a binary Variable, so this stays linear.
-            constraints += [
-                ld.unserved_energy == cp.multiply(ld.demand, self.blackout)
-                for ld in self.loads
-            ]
         if self.node_type == "Ref":
             constraints += [self.theta == 0.0]
         return constraints
+
+    @property
+    def power_balance_duals(self):
+        return self.power_balance_constraint.dual_value
