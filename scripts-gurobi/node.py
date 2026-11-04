@@ -22,9 +22,6 @@ class Node(Component):
         self.sub_area = data["Sub Area"]
         self.zone = data["Zone"]
 
-        # Set other, generic attributes
-        self.theta_max = np.deg2rad(30)  # 30 degree maximum voltage angle
-
         # Initialize resources
         self.resources = []
 
@@ -41,7 +38,9 @@ class Node(Component):
 
     def create_variables(self):
         # Reference bus is pinned by its bounds rather than a constraint row.
-        bound = 0.0 if self.node_type == "Ref" else self.theta_max
+        # Other angles are free: a line's rating already bounds the angle
+        # difference across it, via |dtheta| <= X * max_flow / baseMVA.
+        bound = 0.0 if self.node_type == "Ref" else gp.GRB.INFINITY
         self.theta = self.model.addMVar(
             T, lb=-bound, ub=bound, name=f"theta[{self.name}]")
 

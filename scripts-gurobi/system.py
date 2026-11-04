@@ -15,7 +15,7 @@ from resources import ThermalResource, VariableResource, HydroResource, StorageR
 
 
 class System:
-    def __init__(self, base_dir, system_dir, system_config, forced_outages=True, scenario_seed=0):
+    def __init__(self, base_dir, system_dir, system_config, dynamic_voll=False, scenario_seed=0):
 
         # Save base directory, system directory
         self.base_dir = base_dir
@@ -23,7 +23,10 @@ class System:
         self.system_config = system_config
 
         # Forced outages
-        self.forced_outages = forced_outages
+        self.forced_outages = True
+
+        # Dynamic VoLL
+        self.dynamic_voll = dynamic_voll
 
         # Scenario random seed
         self.scenario_seed = scenario_seed
@@ -56,6 +59,7 @@ class System:
         self.loads = {}
         for load in df_load.index:
             self.loads[load] = Load.from_series(df_load.loc[load])
+            self.loads[load].voll.dynamic = self.dynamic_voll
 
         # 3. Instantiate lines
         self.lines = {}
@@ -262,7 +266,7 @@ class System:
         df_dispatch["thermal"] = sum(resource.p_out.X for resource in self.thermal_resources.values())
         df_dispatch["solar"] = sum(resource.p_out.X for resource in self.variable_resources.values() if resource.resource_type == "solar")
         df_dispatch["wind"] = sum(resource.p_out.X for resource in self.variable_resources.values() if resource.resource_type == "wind")
-        df_dispatch["hydro"] = sum(resource.p_out.getValue() for resource in self.hydro_resources.values())
+        df_dispatch["hydro"] = sum(resource.p_out.X for resource in self.hydro_resources.values())
         df_dispatch["storage charge"] = sum(resource.charge.X for resource in self.storage_resources.values())
         df_dispatch["storage discharge"] = sum(resource.discharge.X for resource in self.storage_resources.values())
         df_dispatch["unserved energy"] = sum(load.unserved_energy.X for load in self.loads.values())

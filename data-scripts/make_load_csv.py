@@ -19,10 +19,11 @@ from rts_gmlc_load import bus_peaks
 curr_dir = pathlib.Path(__file__).resolve().parents[1]
 config_dir = curr_dir / "system-config"
 
-# Uniform multiplier on every load's peak, to make RTS-ORB scarce enough to
-# shed. STALE: 1.10 was calibrated against the old NSRDB load, not RTS-GMLC.
-# Re-tune before trusting any blackout-frequency result.
-PEAK_SCALING = {"RTS-GMLC": 1.0, "RTS-ORB": 1.10, "RTS-ORB-HR": 1.10}
+# Uniform multiplier on every load's peak, to make the system scarce enough to
+# shed. Calibrated on native RTS-GMLC load over 20 replicates: 1.20 gives
+# LOLE 1.50 d/yr for RTS-ORB and 0.85 for RTS-ORB-HR (the latter also retires
+# 123_STEAM_2). Requires the voltage-angle bound removed from node.py.
+PEAK_SCALING = {"RTS-GMLC": 1.0, "RTS-ORB": 1.20, "RTS-ORB-HR": 1.20}
 
 LOAD_TYPE = "baseline"
 

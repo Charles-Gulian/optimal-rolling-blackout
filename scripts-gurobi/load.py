@@ -75,6 +75,8 @@ class Load(Component):
 class VoLL:
     """VoLL model."""
     STATIC_VOLL = 1e4
+    GAMMA = 0.3 # Discount rate
+    BETA = 1e4 # Sensitivity
 
     def __init__(self, load):
         super().__init__()
@@ -85,12 +87,23 @@ class VoLL:
     def create_parameters(self):
         self.static_voll = self.STATIC_VOLL * np.ones(T)
     def create_variables(self):
-        self.dynamic_voll = self.load.model.addMVar(T, lb=0.0, name=f"voll[{self.name}]")
+        if not self.dynamic:
+            return
+        self.dynamic_voll = self.load.model.addMVar(
+            T, lb=0.0, name=f"voll[{self.name}]")
 
     def write_constraints(self):
+        if not self.dynamic:
+            return
+        # voll[t+1] == (1 - gamma) * voll[t] + load_shed[t], for t = 0 .. T-2
         self.voll_model = self.load.model.addConstr(
-            self.dynamic_voll - self.static_voll == 0,
+            self.dynamic_voll[1:] == (1 - self.GAMMA) * self.dynamic_voll[:-1]
+            + self.load.load_shed[:-1],
             name=f"voll_model[{self.name}]"
+        )
+        self.voll_initial = self.load.model.addConstr(
+            self.dynamic_voll[0] == 0.0,
+            name=f"voll_initial[{self.name}]"
         )
 
     def update_timeseries_parameters(self):
@@ -99,6 +112,6 @@ class VoLL:
     @property
     def value(self):
         if self.dynamic:
-            return self.dynamic_voll
+            return self.static_voll + self.BETA * self.dynamic_voll
         else:
             return self.static_voll

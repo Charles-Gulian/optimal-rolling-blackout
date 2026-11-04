@@ -6,22 +6,16 @@ Multi-year simulation of the system under random generator forced outages.
     print(reliability_summary(df))
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
 import gurobipy as gp
 import pathlib
 import pandas as pd
-from tqdm import tqdm
 
 from system import System, UNSERVED_TOL
 
-def simulate_years(system, n_years, year=2020, first_seed=0, days=None, verbose=True):
+def simulate_years(system, n_years, first_seed=0, days=None, year=2020, verbose=True):
     """Solve every day of `year` under `n_years` independent outage draws.
-
     Returns one row per (replicate, day): generation cost, unserved energy cost, total unserved energy, loss-of-load hours
     """
-    if not system.forced_outages:
-        raise ValueError("system was built with forced_outages=False; there is nothing random to replicate")
 
     system.read_timeseries(year)
     system.write_opf()
@@ -29,8 +23,6 @@ def simulate_years(system, n_years, year=2020, first_seed=0, days=None, verbose=
         days = system.available_days(year)
 
     rows = []
-    bar = tqdm(total=n_years * len(days), unit="solve", disable=None if verbose else True,
-               desc="simulating")
     for replicate in range(n_years):
         scenario_seed = first_seed + replicate
         system.scenario_seed = scenario_seed
@@ -62,15 +54,11 @@ def simulate_years(system, n_years, year=2020, first_seed=0, days=None, verbose=
 
             lol_days += total_ue > UNSERVED_TOL
             replicate_ue += total_ue
-            bar.update(1)
-            bar.set_postfix(rep=replicate, lol_days=lol_days,
-                            EUE=f"{replicate_ue:,.0f} MWh", refresh=False)
 
         if verbose:
-            bar.write(f"  replicate {replicate:3} (seed {scenario_seed:6}): "
-                      f"{lol_days:3} loss-of-load days, "
-                      f"{replicate_ue:12,.1f} MWh unserved")
-    bar.close()
+            print(f"  replicate {replicate:3} (seed {scenario_seed:6}): "
+                  f"{lol_days:3} loss-of-load days, "
+                  f"{replicate_ue:12,.1f} MWh unserved", flush=True)
 
     return pd.DataFrame(rows)
 
@@ -91,8 +79,14 @@ def reliability_summary(df):
 
 if __name__ == "__main__":
     root = pathlib.Path(__file__).resolve().parents[1]
-    system = System(root / "data", root / "system-config", "RTS-ORB-HR")
-    df_results = simulate_years(system, 2)
+    system_config = "RTS-ORB-HR"
+    n_years = 5
+
+    system = System(root / "data", root / "system-config", system_config)
+    df_results = simulate_years(system, n_years)
     df_summary = reliability_summary(df_results)
-    print(df_summary)
-    print(df_results["event_type"].value_counts())
+    
+    results_dir = root / "results" / system_config
+    results_dir.mkdir(exist_ok=True, parents=True)
+    df_results.to_csv(results_dir / f"simulation_results_{n_years}yrs.csv")
+    df_summary.to_csv(results_dir / f"results_summary_{n_years}yrs.csv")

@@ -22,9 +22,6 @@ class Node(Component):
         self.sub_area = data["Sub Area"]
         self.zone = data["Zone"]
 
-        # Set other, generic attributes
-        self.theta_max = np.deg2rad(30)  # 30 degree maximum voltage angle
-
         # Initialize resources
         self.resources = []
 
@@ -48,7 +45,6 @@ class Node(Component):
             + cp.sum([l.flow for l in self.in_lines])  # + line inflows
             - cp.sum([l.flow for l in self.out_lines])  # - line outflows
             == cp.sum([ld.demand - ld.unserved_energy for ld in self.loads]),  # = served load (power balance constraint)
-            self.theta <= self.theta_max, self.theta >= -self.theta_max  # Voltage angle limits
         ]
         self.power_balance_constraint = constraints[0]
         if self.node_type == "Ref":
