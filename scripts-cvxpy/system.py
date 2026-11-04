@@ -265,6 +265,20 @@ class System:
         for i, name in enumerate(self.load_order):
             self.loads[name].load_shed.value = z[i]
 
+    def grad_J(self, z):
+        """dJ/dz = (voll + BETA x[:-1]) * demand + lam[1:]; the min-H objective's coefficients."""
+        x, lam = self.x_eval(z), self.lam_eval(z)
+        return ((self._stack("voll") + BETA * x[:, :-1]) * self._stack("demand")
+                + lam[:, 1:])
+
+    def fw_gap(self, z_hat, z):
+        """Frank-Wolfe gap -grad(z_hat).(z - z_hat) >= 0. Zero certifies stationarity.
+
+        The min-H subproblem minimises grad_J(z_hat) over the feasible set, so this
+        is the usual conditional-gradient optimality measure.
+        """
+        return -float(np.sum(self.grad_J(z_hat) * (z - z_hat)))
+
     def exact_line_search(self, z_hat, z):
         """Step in [0, 1] minimising J along z_hat -> z. J is quadratic there."""
         g = z - z_hat
@@ -276,9 +290,10 @@ class System:
             return float(np.clip(-b / (2 * a), 0.0, 1.0))
         return 0.0 if phi0 <= phi1 else 1.0
 
-    def solve_mpols(self, date, max_iter=25, tol=1e-6, verbose=False):
+    def solve_mpols(self, date, max_iter=100, tol=1e-9, verbose=False):
         """Min-H solve of multi-period load shedding with dynamic unserved energy costs.
 
+        Stops when the Frank-Wolfe gap falls below `tol` relative to the objective.
         Returns the final objective; the iteration log is left in self.msa_history
         and the load variables hold the final iterate.
         """
@@ -295,19 +310,21 @@ class System:
             self.set_costate(z_hat)
             self.prob_hamiltonian.solve(solver=cp.GUROBI, **self.solver_options)
             z_star = self.shed_matrix
-            step = float(np.abs(z_star - z_hat).max())
+            J = self.J_eval(z_hat)
+            gap = self.fw_gap(z_hat, z_star)
             alpha = self.exact_line_search(z_hat, z_star)
-            rows.append({"iter": k, "H": self.H_eval(z_hat), "J": self.J_eval(z_hat),
-                         "alpha": alpha, "step": step})
+            rows.append({"iter": k, "H": self.H_eval(z_hat), "J": J, "fw_gap": gap,
+                         "alpha": alpha, "step": float(np.abs(z_star - z_hat).max())})
             if verbose:
-                print(f"  [{k:3}] H {rows[-1]['H']:16,.3f}  J {rows[-1]['J']:16,.3f}"
-                      f"  alpha {alpha:7.4f}  max|dz| {step:.3e}", flush=True)
-            if step < tol:
+                print(f"  [{k:3}] H {rows[-1]['H']:16,.3f}  J {J:16,.3f}"
+                      f"  fw_gap {gap:11.3e}  alpha {alpha:7.4f}", flush=True)
+            if gap <= tol * max(abs(J), 1.0):
                 status = "converged"
                 break
-            if alpha < tol:
-                # The min-H solution is not an improving direction: stalled, not solved.
-                status = "stalled"
+            if alpha <= 0.0:
+                # Gap is open but the line search rejects the step: that should not
+                # happen for a quadratic J, so flag it rather than call it converged.
+                status = "line_search_failed"
                 break
             z_hat = (1 - alpha) * z_hat + alpha * z_star
 

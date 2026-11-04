@@ -74,14 +74,15 @@ class Load(Component):
 
 class VoLL:
     """VoLL model."""
-    STATIC_VOLL = 1e4
-    GAMMA = 0.3 # Discount rate
-    BETA = 1e4 # Sensitivity
+    STATIC_VOLL = 2.2e4 # $/MWh
+    GAMMA = 0.6 # Discount rate
+    BETA = 1.2e4 # Sensitivity
 
     def __init__(self, load):
         super().__init__()
         self.name = f"{load.name}_voll"
         self.dynamic = False
+        self.beta = self.BETA
         self.load = load
 
     def create_parameters(self):
@@ -112,6 +113,6 @@ class VoLL:
     @property
     def value(self):
         if self.dynamic:
-            return self.static_voll + self.BETA * self.dynamic_voll
+            return self.static_voll + self.beta * self.dynamic_voll
         else:
             return self.static_voll

@@ -7,15 +7,17 @@ import pathlib
 from component import T
 
 UNSERVED_TOL = 1e-3  # MWh
+UE_CAP_TOL = 1e-2    # relative slack on the total unserved energy cap
 
 from node import Node
 from line import Line
-from load import Load
+from load import Load, VoLL
 from resources import ThermalResource, VariableResource, HydroResource, StorageResource
 
 
 class System:
-    def __init__(self, base_dir, system_dir, system_config, dynamic_voll=False, scenario_seed=0):
+    def __init__(self, base_dir, system_dir, system_config, dynamic_voll=False,
+                 scenario_seed=0, beta=None, fair=None, ue_cap=False):
 
         # Save base directory, system directory
         self.base_dir = base_dir
@@ -27,6 +29,13 @@ class System:
 
         # Dynamic VoLL
         self.dynamic_voll = dynamic_voll
+        self.beta = VoLL.BETA if beta is None else beta
+
+        # Fairness tolerance; None leaves the caps out of the model entirely.
+        self.fair = fair
+
+        # Lexicographic cap on total unserved energy; False leaves the row out.
+        self.ue_cap = ue_cap
 
         # Scenario random seed
         self.scenario_seed = scenario_seed
@@ -60,6 +69,7 @@ class System:
         for load in df_load.index:
             self.loads[load] = Load.from_series(df_load.loc[load])
             self.loads[load].voll.dynamic = self.dynamic_voll
+            self.loads[load].voll.beta = self.beta
 
         # 3. Instantiate lines
         self.lines = {}
@@ -177,11 +187,63 @@ class System:
         for obj in self.components:
             obj.write_constraints()
 
+        if self.fair is not None:
+            self.write_fairness_constraints()
+        if self.ue_cap:
+            self.write_ue_cap_constraint()
+
         ### Objective Function ###
 
+        self.write_objective()
+
+    def write_objective(self):
+        """Set the objective to total unserved energy costs."""
         self.total_unserved_energy_costs = gp.quicksum(l.cost_expression() for l in self.loads.values())
         self.model.setObjective(self.total_unserved_energy_costs, gp.GRB.MINIMIZE)
         self.model.update()
+
+    def set_beta(self, beta):
+        """Set the VoLL sensitivity on every load and rebuild the objective."""
+        self.beta = beta
+        for load in self.loads.values():
+            load.voll.beta = beta
+        self.write_objective()
+
+    def write_fairness_constraints(self):
+        """Cap each load's total shed at (1 + fair) x the mean across loads."""
+        L = len(self.loads)
+        self.mean_shed = self.model.addVar(lb=0.0, name="mean_shed")
+        self.model.update()
+        self.mean_shed_constraint = self.model.addConstr(
+            L * self.mean_shed == gp.quicksum(
+                gp.quicksum(l.load_shed.tolist()) for l in self.loads.values()),
+            name="mean_shed")
+        self.fairness_constraints = {
+            name: self.model.addConstr(
+                gp.quicksum(load.load_shed.tolist())
+                - (1.0 + self.fair) * self.mean_shed <= 0,
+                name=f"fairness[{name}]")
+            for name, load in self.loads.items()}
+        self.model.update()
+
+    def set_fair(self, fair):
+        """Set the fairness tolerance on every per-load cap."""
+        self.fair = fair
+        for row in self.fairness_constraints.values():
+            self.model.chgCoeff(row, self.mean_shed, -(1.0 + fair))
+        self.model.update()
+
+    def write_ue_cap_constraint(self):
+        """Cap total unserved energy; the RHS is set per day by set_ue_cap."""
+        self.ue_cap_constraint = self.model.addConstr(
+            gp.quicksum(gp.quicksum(l.unserved_energy.tolist())
+                        for l in self.loads.values()) <= gp.GRB.INFINITY,
+            name="ue_cap")
+        self.model.update()
+
+    def set_ue_cap(self, cap):
+        """Set the total unserved energy cap for the next solve."""
+        self.ue_cap_constraint.RHS = cap * (1.0 + UE_CAP_TOL)
 
     def solve_opf(self, date):
         self.opf_date = date
