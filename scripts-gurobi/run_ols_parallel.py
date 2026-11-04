@@ -147,7 +147,7 @@ def run_task(config, voll, beta, fair, lex, seed, days, out_root, force, threads
             n_bad += 1
 
     pd.DataFrame(rows).to_csv(marker, index=False)   # written last: resume marker
-    return (config, variant, seed, "ok", time.time() - t_task, len(dates), n_bad)
+    return (config, variant, seed, "ok", time.time() - t_task, len(days), n_bad)
 
 
 def build_tasks(results_csv, configs, volls, betas, fairs, lex, seeds=None):
