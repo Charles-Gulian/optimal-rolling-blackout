@@ -4,12 +4,8 @@ import gurobipy as gp
 
 from component import Component, T
 
-# Flat value of lost load, $/MWh. Placeholder.
-DEFAULT_VOLL = 1e4
-
-
 class Load(Component):
-    """Electricity demand of one type at one node, with flat VoLL."""
+    """Electricity demand of one type at one node."""
 
     PROFILE_SOURCE = "RTS-GMLC"
     PROFILE_PATTERN = "{source}_load-profile_bus{bus}_{year}.csv"
@@ -24,11 +20,11 @@ class Load(Component):
         self.node_ID = data["Bus ID"]
         self.load_type = data["Load Type"]
         self.peak_load = data["Peak MW"]
-        self.static_voll = DEFAULT_VOLL
 
-        # Initialize node, profile
+        # Initialize node, profile, voll
         self.node = None
         self.load_profile = None
+        self.voll = VoLL(self) # Static by default
 
     @classmethod
     def from_series(cls, df: pd.Series):
@@ -44,41 +40,65 @@ class Load(Component):
         """Fraction-of-peak hourly shape for this load."""
         fname = self.PROFILE_PATTERN.format(
             source=self.PROFILE_SOURCE, bus=self.node_ID, year=year)
-        ts_data_path = (self.system.base_dir / "load-data" / "profiles"
-                        / f"bus{self.node_ID}" / fname)
+        ts_data_path = (self.system.base_dir / "load-data" / "profiles" / f"bus{self.node_ID}" / fname)
         df_load = pd.read_csv(ts_data_path, index_col=[0])
         df_load.index = pd.to_datetime(df_load.index)
         self.load_profile = df_load.squeeze()
 
     def create_parameters(self):
-        # Plain arrays, rewritten each solve. gurobipy has no Parameter object:
-        # data reaches the model through bounds, RHS and coefficients instead.
         self.demand = np.zeros(T)
-        self.voll = np.full(T, self.static_voll)
+        self.voll.create_parameters()
 
     def create_variables(self):
-        self.load_shed = self.model.addMVar(
-            T, lb=0.0, ub=1.0, name=f"shed[{self.name}]")
-        self.unserved_energy = self.model.addMVar(
-            T, lb=0.0, name=f"ue[{self.name}]")
+        self.load_shed = self.model.addMVar(T, lb=0.0, ub=1.0, name=f"shed[{self.name}]")
+        self.unserved_energy = self.model.addMVar(T, lb=0.0, name=f"ue[{self.name}]")
+        self.voll.create_variables()
 
     def write_constraints(self):
-        # unserved_energy == demand * load_shed. demand is a coefficient on
-        # load_shed, so it is rewritten with chgCoeff each solve; the -1.0 here
-        # is a placeholder that reserves the matrix entry.
-        self.ue_definition = self.model.addConstr(
-            self.unserved_energy - 1.0 * self.load_shed == np.zeros(T),
-            name=f"ue_def[{self.name}]")
-        self._ue_rows = self.ue_definition.tolist()
-        self._shed_vars = self.load_shed.tolist()
+        self.ue_constraint = self.model.addConstr(
+            self.unserved_energy - self.demand * self.load_shed == 0,
+            name=f"ue_constraint[{self.name}]"
+        )
+        self.ue_constraint_rows = self.ue_constraint.tolist()
+        self.load_shed_vars = self.load_shed.tolist()
+        self.voll.write_constraints()
 
     def update_timeseries_parameters(self, date: pd.Timestamp):
-        self.demand = (self.peak_load
-                       * self.load_profile.loc[date:date + pd.Timedelta(hours=T - 1)].values)
-        self.voll = np.full(T, self.static_voll)  # Temporary
-        self.unserved_energy.UB = self.demand
+        self.demand = (self.peak_load * self.load_profile.loc[date:date + pd.Timedelta(hours=T - 1)].values)
         for t in range(T):
-            self.model.chgCoeff(self._ue_rows[t], self._shed_vars[t], -self.demand[t])
+            self.model.chgCoeff(self.ue_constraint_rows[t], self.load_shed_vars[t], -self.demand[t])
+        self.voll.update_timeseries_parameters()
 
     def cost_expression(self):
-        return gp.quicksum(self.voll[t] * self.unserved_energy[t] for t in range(T))
+        return gp.quicksum(self.voll.value[t] * self.unserved_energy[t] for t in range(T))
+
+class VoLL:
+    """VoLL model."""
+    STATIC_VOLL = 1e4
+
+    def __init__(self, load):
+        super().__init__()
+        self.name = f"{load.name}_voll"
+        self.dynamic = False
+        self.load = load
+
+    def create_parameters(self):
+        self.static_voll = self.STATIC_VOLL * np.ones(T)
+    def create_variables(self):
+        self.dynamic_voll = self.load.model.addMVar(T, lb=0.0, name=f"voll[{self.name}]")
+
+    def write_constraints(self):
+        self.voll_model = self.load.model.addConstr(
+            self.dynamic_voll - self.static_voll == 0,
+            name=f"voll_model[{self.name}]"
+        )
+
+    def update_timeseries_parameters(self):
+        pass
+
+    @property
+    def value(self):
+        if self.dynamic:
+            return self.dynamic_voll
+        else:
+            return self.static_voll

@@ -6,10 +6,8 @@ import pathlib
 
 from component import T
 
-UNSERVED_TOL = 1e-3  # MWh; ignore LP/MILP numerical dust
+UNSERVED_TOL = 1e-3  # MWh
 
-# Timestamps are tz-naive throughout: RTS-GMLC profiles are on a plain local
-# clock, so nothing is shifted anywhere.
 from node import Node
 from line import Line
 from load import Load
@@ -17,8 +15,7 @@ from resources import ThermalResource, VariableResource, HydroResource, StorageR
 
 
 class System:
-    def __init__(self, base_dir, system_dir, system_config,
-                 forced_outages=True, scenario_seed=0):
+    def __init__(self, base_dir, system_dir, system_config, forced_outages=True, scenario_seed=0):
 
         # Save base directory, system directory
         self.base_dir = base_dir
@@ -46,11 +43,7 @@ class System:
         # Select unit types
         unit_types = ["CT", "STEAM", "CC", "NUCLEAR", "PV", "RTPV", "WIND", "HYDRO", "ROR", "STORAGE"]
         # Select columns
-        columns = ["Bus ID", "Unit Type", "Category", "Fuel", "Fuel Price $/MMBTU", "HR_avg_0", "VOM", "PMax MW", "PMin MW", "Ramp Rate MW/Min", "FOR", "MTTR Hr", "Storage Roundtrip Efficiency"]
-        # Configs we derive ourselves carry an explicit Resource ID; the
-        # pristine upstream RTS-GMLC does not.
-        if "Resource ID" in df_gen.columns:
-            columns = columns + ["Resource ID"]
+        columns = ["Bus ID", "Unit Type", "Category", "Fuel", "Fuel Price $/MMBTU", "HR_avg_0", "VOM", "PMax MW", "PMin MW", "Ramp Rate MW/Min", "FOR", "MTTR Hr", "Storage Roundtrip Efficiency", "Resource ID"]
         # Get final resource input data
         df_gen = df_gen.loc[df_gen["Unit Type"].isin(unit_types), columns]
 
@@ -60,12 +53,6 @@ class System:
             self.nodes[node] = Node.from_series(df_bus.loc[node])
 
         # 2. Instantiate loads (one row per bus in load.csv).
-        #
-        # Loads are priced at the flat VOLL that Load picks up from load.csv,
-        # or its default when that column is absent. The per-policy
-        # voll_<model>.csv files that used to be merged in here, and the
-        # CoolingLoad subclass that consumed their thermal parameters, went
-        # with the old policy comparison; pricing is being rebuilt.
         self.loads = {}
         for load in df_load.index:
             self.loads[load] = Load.from_series(df_load.loc[load])
@@ -120,10 +107,7 @@ class System:
 
     @property
     def components(self):
-        # Loads first, then nodes: a Node's power-balance RHS is the sum of its
-        # loads' demand, so the loads must have updated theirs by then.
-        return (list(self.loads.values()) + list(self.resources.values())
-                + list(self.lines.values()) + list(self.nodes.values()))
+        return (list(self.loads.values()) + list(self.resources.values()) + list(self.lines.values()) + list(self.nodes.values()))
 
     @property
     def load_profile(self):
@@ -166,6 +150,7 @@ class System:
                 if all(day + off in available for off in offsets)]
 
     def write_opf(self):
+
         # Create the gurobipy model first: variables are created on it.
         self.model = gp.Model(f"opf[{self.system_config}]")
         self.model.Params.OutputFlag = 0
@@ -190,26 +175,19 @@ class System:
 
         ### Objective Function ###
 
-        self.total_unserved_energy_costs = gp.quicksum(
-            l.cost_expression() for l in self.loads.values())
+        self.total_unserved_energy_costs = gp.quicksum(l.cost_expression() for l in self.loads.values())
         self.model.setObjective(self.total_unserved_energy_costs, gp.GRB.MINIMIZE)
         self.model.update()
 
     def solve_opf(self, date):
         self.opf_date = date
 
-        # Push this day's data into bounds, RHS and coefficients
         for obj in self.components:
             obj.update_timeseries_parameters(date)
         self.model.update()
 
         self.model.optimize()
         return self.model.ObjVal
-
-    def solve_mpols(self, date):
-
-        # Solve multi-period optimal load shedding with dynamic unserved energy costs using min-H method
-        pass
 
     # ------------------------------------------------------------------
     # Results reporting for the current solve

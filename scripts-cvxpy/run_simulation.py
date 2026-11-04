@@ -4,16 +4,6 @@ Multi-year simulation of the system under random generator forced outages.
     system = System(data_dir, config_dir, "RTS-ORB")
     df = simulate_years(system, n_years=10)
     print(reliability_summary(df))
-
-"N years" means N independent forced-outage draws over the SAME calendar
-year, not N different years of weather. RTS-GMLC ships one year of load and
-renewable data (2020), so that is the only shape there is; the randomness
-comes entirely from which thermal units happen to be out when. That is also
-the quantity a reliability metric is averaging over, so it is the right thing
-to replicate -- a single draw tells you almost nothing about LOLE.
-
-Only generator outages are sampled. Lines are assumed perfectly available;
-branch.csv does carry "Perm OutRate" and "Duration" if that ever changes.
 """
 
 import numpy as np
@@ -86,12 +76,7 @@ def simulate_years(system, n_years, year=2020, first_seed=0, days=None, verbose=
     return pd.DataFrame(rows)
 
 def reliability_summary(df):
-    """Standard reliability metrics per replicate, plus the mean over them.
-
-    LOLE is reported in both days and hours per year because the two are
-    routinely confused and differ here: a day counts once however many of its
-    hours were short.
-    """
+    """Standard reliability metrics per replicate, plus the mean over them."""
     per = df.groupby("replicate").agg(
         LOLE_days=("total_ue", lambda s: int((s > UNSERVED_TOL).sum())),
         LOLH_hours=("ue_hours", "sum"),
