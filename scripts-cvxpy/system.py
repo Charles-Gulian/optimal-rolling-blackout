@@ -12,7 +12,7 @@ UNSERVED_TOL = 1e-3  # MWh; ignore LP/MILP numerical dust
 # clock, so nothing is shifted anywhere.
 from node import Node
 from line import Line
-from load import Load
+from load import Load, GAMMA, BETA
 from resources import ThermalResource, VariableResource, HydroResource, StorageResource
 
 
@@ -187,8 +187,13 @@ class System:
         self.total_unserved_energy_costs = cp.sum([l.cost_expression() for l in self.loads.values()])
         self.objective = cp.Minimize(self.total_unserved_energy_costs)
 
+        # Min-H objective: same variables and constraints, state and costate
+        # entering as parameters. Used by solve_mpols.
+        self.total_hamiltonian = cp.sum([l.hamiltonian_expression() for l in self.loads.values()])
+
         ### Problem ###
         self.prob = cp.Problem(self.objective, self.constraints)
+        self.prob_hamiltonian = cp.Problem(cp.Minimize(self.total_hamiltonian), self.constraints)
 
     def solve_opf(self, date):
         # Solve CVXPY model
@@ -203,10 +208,113 @@ class System:
 
         return result
 
-    def solve_mpols(self, date):
+    # ------------------------------------------------------------------
+    # Multi-period optimal load shedding, min-H / MSA method
+    # ------------------------------------------------------------------
 
-        # Solve multi-period optimal load shedding with dynamic unserved energy costs using min-H method
-        pass
+    @property
+    def load_order(self):
+        """Load names in a fixed order; rows of every (n_loads, T) array below."""
+        return list(self.loads.keys())
+
+    def _stack(self, attr):
+        return np.vstack([getattr(self.loads[n], attr).value for n in self.load_order])
+
+    @property
+    def shed_matrix(self):
+        """(n_loads, T) load shed fractions currently held by the variables."""
+        return self._stack("load_shed")
+
+    def x_eval(self, z):
+        """Forward state: x[:, t+1] = (1 - GAMMA) x[:, t] + z[:, t], x[:, 0] = 0."""
+        x = np.zeros((z.shape[0], T + 1))
+        for t in range(T):
+            x[:, t + 1] = (1 - GAMMA) * x[:, t] + z[:, t]
+        return x
+
+    def lam_eval(self, z):
+        """Backward costate: lam[:, t] = BETA u[:, t] + (1 - GAMMA) lam[:, t+1], lam[:, T] = 0."""
+        u = self._stack("demand") * z
+        lam = np.zeros((z.shape[0], T + 1))
+        for t in reversed(range(T)):
+            lam[:, t] = BETA * u[:, t] + (1 - GAMMA) * lam[:, t + 1]
+        return lam
+
+    def J_eval(self, z):
+        """True objective: sum over buses and hours of (voll + BETA x) * unserved energy."""
+        x = self.x_eval(z)
+        return float(np.sum((self._stack("voll") + BETA * x[:, :-1])
+                            * self._stack("demand") * z))
+
+    def H_eval(self, z):
+        """Hamiltonian at z, including the constant that the LP objective drops."""
+        x, lam = self.x_eval(z), self.lam_eval(z)
+        u = self._stack("demand") * z
+        return float(np.sum((self._stack("voll") + BETA * x[:, :-1]) * u)
+                     + np.sum(lam[:, 1:] * z)
+                     + (1 - GAMMA) * np.sum(lam[:, 1:] * x[:, :-1]))
+
+    def set_costate(self, z):
+        """Freeze x and lam from `z` into every load's parameters."""
+        x, lam = self.x_eval(z), self.lam_eval(z)
+        for i, name in enumerate(self.load_order):
+            self.loads[name].set_costate(x[i], lam[i])
+
+    def set_shed(self, z):
+        """Write a shed matrix back into the load variables."""
+        for i, name in enumerate(self.load_order):
+            self.loads[name].load_shed.value = z[i]
+
+    def exact_line_search(self, z_hat, z):
+        """Step in [0, 1] minimising J along z_hat -> z. J is quadratic there."""
+        g = z - z_hat
+        phi0, phi12, phi1 = (self.J_eval(z_hat), self.J_eval(z_hat + 0.5 * g),
+                             self.J_eval(z_hat + g))
+        a = 2 * phi1 + 2 * phi0 - 4 * phi12
+        b = phi1 - phi0 - a
+        if a > 1e-12:
+            return float(np.clip(-b / (2 * a), 0.0, 1.0))
+        return 0.0 if phi0 <= phi1 else 1.0
+
+    def solve_mpols(self, date, max_iter=25, tol=1e-6, verbose=False):
+        """Min-H solve of multi-period load shedding with dynamic unserved energy costs.
+
+        Returns the final objective; the iteration log is left in self.msa_history
+        and the load variables hold the final iterate.
+        """
+        self.opf_date = date
+        for obj in self.components:
+            obj.update_timeseries_parameters(date)
+
+        # Static-VoLL solution as the initial iterate.
+        self.prob.solve(solver=cp.GUROBI, **self.solver_options)
+        z_hat = self.shed_matrix
+
+        rows, status = [], "max_iter"
+        for k in range(max_iter):
+            self.set_costate(z_hat)
+            self.prob_hamiltonian.solve(solver=cp.GUROBI, **self.solver_options)
+            z_star = self.shed_matrix
+            step = float(np.abs(z_star - z_hat).max())
+            alpha = self.exact_line_search(z_hat, z_star)
+            rows.append({"iter": k, "H": self.H_eval(z_hat), "J": self.J_eval(z_hat),
+                         "alpha": alpha, "step": step})
+            if verbose:
+                print(f"  [{k:3}] H {rows[-1]['H']:16,.3f}  J {rows[-1]['J']:16,.3f}"
+                      f"  alpha {alpha:7.4f}  max|dz| {step:.3e}", flush=True)
+            if step < tol:
+                status = "converged"
+                break
+            if alpha < tol:
+                # The min-H solution is not an improving direction: stalled, not solved.
+                status = "stalled"
+                break
+            z_hat = (1 - alpha) * z_hat + alpha * z_star
+
+        self.set_shed(z_hat)
+        self.msa_history = pd.DataFrame(rows)
+        self.msa_status = status
+        return self.J_eval(z_hat)
 
     # ------------------------------------------------------------------
     # Results reporting for the current solve

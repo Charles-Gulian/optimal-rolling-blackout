@@ -7,6 +7,11 @@ from component import Component, T
 # Flat value of lost load, $/MWh. Placeholder.
 DEFAULT_VOLL = 1e4
 
+# Discomfort dynamics: x[t+1] = (1 - GAMMA) x[t] + load_shed[t], and the
+# marginal cost of load shed rises by BETA per unit of x.
+GAMMA = 0.3
+BETA = DEFAULT_VOLL
+
 
 class Load(Component):
     """Electricity demand of one type at one node, with flat VoLL."""
@@ -53,22 +58,35 @@ class Load(Component):
     def create_parameters(self):
         self.demand = cp.Parameter(T, nonneg=True)
         self.voll = cp.Parameter(T, nonneg=True)
-        # voll * demand precomputed, to keep the objective DPP.
-        self.voll_demand = cp.Parameter(T, nonneg=True)
+        # Min-H state and costate, frozen at the current iterate each pass.
+        self.x = cp.Parameter(T + 1, nonneg=True)
+        self.lam = cp.Parameter(T + 1)
 
     def update_timeseries_parameters(self, date: pd.Timestamp):
         self.demand.value = self.peak_load * self.load_profile.loc[date:date + pd.Timedelta(hours=T - 1)].values
         self.voll.value = np.full(T, self.static_voll) # Temporary
-        self.voll_demand.value = self.voll.value * self.demand.value
+        self.set_costate(np.zeros(T + 1), np.zeros(T + 1))
+
+    def set_costate(self, x, lam):
+        """Freeze the state and costate trajectories for the next min-H solve."""
+        self.x.value = x
+        self.lam.value = lam
 
     def create_variables(self):
         self.load_shed = cp.Variable(T, nonneg=True)
-
-    def create_expressions(self):
-        self.unserved_energy = cp.multiply(self.demand, self.load_shed)
+        self.unserved_energy = cp.Variable(T, nonneg=True)
 
     def write_constraints(self):
-        return [self.load_shed <= np.ones_like(self.demand.value)]  # Limit load shed fraction 0 <= z <= 1
+        return [
+            self.unserved_energy == cp.multiply(self.demand, self.load_shed),
+            self.load_shed <= 1,  # Limit load shed fraction 0 <= z <= 1
+        ]
 
     def cost_expression(self):
-        return cp.sum(cp.multiply(self.voll_demand, self.load_shed))
+        return cp.sum(cp.multiply(self.voll, self.unserved_energy))
+
+    def hamiltonian_expression(self):
+        """Per-load min-H objective: static cost + state cost + costate term."""
+        return (cp.sum(cp.multiply(self.voll, self.unserved_energy))
+                + cp.sum(cp.multiply(BETA * self.x[:-1], self.unserved_energy))
+                + cp.sum(cp.multiply(self.lam[1:], self.load_shed)))
